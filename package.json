@@ -1,5 +1,10 @@
 {
-  "name": "appwrite-function",
+  "name": "appwrite-game-backend",
   "version": "1.0.0",
-  "main": "index.js"
+  "description": "Settlement & Backend Function for Indian Club Game",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "node-appwrite": "^14.1.0"
+  }
 }
