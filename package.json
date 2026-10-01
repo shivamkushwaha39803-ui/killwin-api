@@ -1,9 +1,5 @@
 {
-  "name": "killwin-api",
+  "name": "appwrite-function",
   "version": "1.0.0",
-  "type": "module",
-  "main": "index.js",
-  "dependencies": {
-    "node-appwrite": "^14.0.0"
-  }
+  "main": "index.js"
 }
