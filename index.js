@@ -66,8 +66,12 @@ async function getUser(ctx, uid) { const row = await safeGetRow(ctx, TABLES.user
 
 function profileResponse(row) {
   return {
-    id: row.$id, uid: row.uid || row.$id, username: row.name || row.username || 'Gamer', phone: row.phone || '',
-    balance: Number(row.balance || 0), depositBalance: Number(row.depositBalance || 0), winningBalance: Number(row.winningBalance || 0)
+    id: row.$id, uid: row.uid || row.$id, 
+    username: row.name || row.username || 'Gamer', 
+    phone: row.phone || '',
+    balance: Number(row.balance || 0), 
+    depositBalance: Number(row.depositBalance || row.deposit_balance || 0), 
+    winningBalance: Number(row.winningBalance || row.winning_balance || 0)
   };
 }
 
@@ -76,7 +80,7 @@ async function requireAdmin(ctx) {
   const direct = await safeGetRow(ctx, TABLES.admins, uid);
   if (direct && String(direct.role || 'admin').toLowerCase() === 'admin') return uid;
   const list = await listRows(ctx, TABLES.admins, 100);
-  const ok = (list.rows || []).some(r => String(r.userId || r.uid || r.$id || '') === uid && String(r.role || 'admin').toLowerCase() === 'admin');
+  const ok = (list.rows || []).some(r => String(r.userId || r.uid || r.user_id || r.$id || '') === uid && String(r.role || 'admin').toLowerCase() === 'admin');
   if (!ok) throw new Error('Admin verification failed.');
   return uid;
 }
@@ -87,10 +91,15 @@ async function actionCreateProfile(ctx, data) {
   if (existing) return profileResponse(existing);
   const username = String(data.username || 'Gamer').trim().slice(0, 80);
   const phone = String(data.phone || '').trim().slice(0, 40);
-  // FIXED: Users table has 'name', 'phone', 'balance', 'depositBalance', 'winningBalance'
-  const row = await upsertRow(ctx, TABLES.users, uid, {
-    uid, name: username, phone, balance: 0, depositBalance: 0, winningBalance: 0
-  });
+  
+  // FIXED: Supports both `name` and `username` columns, and camelCase balances
+  const payload = {
+    uid: uid, phone: phone, balance: 0, 
+    depositBalance: 0, winningBalance: 0,
+    name: username, username: username,
+    createdAt: new Date().toISOString()
+  };
+  const row = await upsertRow(ctx, TABLES.users, uid, payload);
   return profileResponse(row);
 }
 
@@ -98,13 +107,14 @@ async function actionGetProfile(ctx) { const uid = await requireUser(ctx); retur
 
 async function actionGetPlatformConfig(ctx) {
   const row = await safeGetRow(ctx, TABLES.config, 'platform');
-  // FIXED: Config table uses upiId and qrImgUrl, but keeping fallbacks
+  // FIXED: Uses camelCase upiId and qrImgUrl
   return row ? { upiId: row.upiId || row.upi_id || '', qrImgUrl: row.qrImgUrl || row.qr_img_url || '' } : { upiId: '', qrImgUrl: '' };
 }
 
 async function actionSetPlatformConfig(ctx, data) {
   await requireAdmin(ctx);
   const payload = {};
+  // FIXED: Saves to camelCase
   if (data.upiId !== undefined) payload.upiId = String(data.upiId || '').trim();
   if (data.qrImgUrl !== undefined) payload.qrImgUrl = String(data.qrImgUrl || '').trim();
   if (!Object.keys(payload).length) return { ok: true };
@@ -121,7 +131,9 @@ async function actionEnsureGameRound(ctx, data) {
   if (!round) {
     const outcome = generateOutcome(game_id, current.period);
     round = await upsertRow(ctx, TABLES.game_rounds, currentId, {
-      gameId: game_id, period: current.period, status: 'open', resultJson: JSON.stringify(outcome)
+      gameId: game_id, game_id: game_id, period: current.period, status: 'open', 
+      resultJson: JSON.stringify(outcome), result_json: JSON.stringify(outcome),
+      start_at_ms: current.startAtMs, end_at_ms: current.endAtMs
     });
   }
   const prev = periodInfo(game_id, current.startAtMs - 1);
@@ -147,9 +159,11 @@ async function actionPlaceGameBet(ctx, data) {
   if (balance < amount) throw new Error('Insufficient balance.');
   const betId = `bet_${randomId()}`;
   const updatedBalance = money(balance - amount);
+  
   await updateRow(ctx, TABLES.users, uid, { balance: updatedBalance });
   const bet = await createRow(ctx, TABLES.bets, {
-    userId: uid, gameId: game_id, period: round.period, selection, category, amount, status: 'open', payout: 0
+    userId: uid, user_id: uid, gameId: game_id, game_id: game_id, period: round.period, 
+    selection, category, amount, status: 'open', payout: 0, createdAt: new Date().toISOString()
   }, betId);
   return { betId, period: round.period, balance: updatedBalance, bet };
 }
@@ -158,11 +172,11 @@ async function settleRoundInternal(ctx, game_id, period) {
   const roundId = `${game_id}_${period}`;
   const round = await safeGetRow(ctx, TABLES.game_rounds, roundId);
   if (!round) return { settled: false, reason: 'round_not_found' };
-  if (round.status === 'settled') return { settled: true, period, ...parseResult(round.resultJson), settledBets: [] };
+  if (round.status === 'settled') return { settled: true, period, ...parseResult(round.resultJson || round.result_json), settledBets: [] };
   if (Number(round.end_at_ms) > nowMs()) return { settled: false, reason: 'round_still_open' };
   try { await updateRow(ctx, TABLES.game_rounds, roundId, { status: 'settling' }); } 
-  catch (e) { const latest = await safeGetRow(ctx, TABLES.game_rounds, roundId); if (latest?.status === 'settled') { return { settled: true, period, ...parseResult(latest.resultJson), settledBets: [] }; } return { settled: false, reason: 'settlement_in_progress' }; }
-  const outcome = parseResult(round.resultJson) || generateOutcome(game_id, period);
+  catch (e) { const latest = await safeGetRow(ctx, TABLES.game_rounds, roundId); if (latest?.status === 'settled') { return { settled: true, period, ...parseResult(latest.resultJson || latest.result_json), settledBets: [] }; } return { settled: false, reason: 'settlement_in_progress' }; }
+  const outcome = parseResult(round.resultJson || round.result_json) || generateOutcome(game_id, period);
   const all = await listAllRows(ctx, TABLES.bets);
   const bets = all.filter(b => (b.gameId || b.game_id) === game_id && b.period === period && b.status === 'open');
   const settledBets = [];
@@ -177,7 +191,8 @@ async function settleRoundInternal(ctx, game_id, period) {
     settledBets.push({ ...bet, status: win ? 'won' : 'lost', payout });
   }
   await updateRow(ctx, TABLES.game_rounds, roundId, {
-    status: 'settled', resultJson: JSON.stringify(outcome), result: String(outcome.number ?? outcome.winner ?? ''), color: outcome.color || '', size: outcome.size || ''
+    status: 'settled', resultJson: JSON.stringify(outcome), result_json: JSON.stringify(outcome), 
+    result: String(outcome.number ?? outcome.winner ?? ''), color: outcome.color || '', size: outcome.size || '', settledAt: new Date().toISOString()
   });
   return { settled: true, period, ...outcome, settledBets };
 }
@@ -186,13 +201,13 @@ async function actionSettleGameRound(ctx, data) { const game_id = String(data.ga
 
 async function actionGetWingoHistory(ctx) {
   const list = await listRows(ctx, TABLES.game_rounds, 100);
-  const history = (list.rows || []).filter(x => (x.gameId || x.game_id) === 'wingo' && x.status === 'settled').sort((a, b) => String(b.period).localeCompare(String(a.period))).slice(0, 50).map(x => { const r = parseResult(x.resultJson) || {}; return { period: x.period, number: Number(r.number), color: r.color || '', size: r.size || '' }; });
+  const history = (list.rows || []).filter(x => (x.gameId || x.game_id) === 'wingo' && x.status === 'settled').sort((a, b) => String(b.period).localeCompare(String(a.period))).slice(0, 50).map(x => { const r = parseResult(x.resultJson || x.result_json) || {}; return { period: x.period, number: Number(r.number), color: r.color || '', size: r.size || '' }; });
   return { history };
 }
 
 async function actionGetTigerHistory(ctx) {
   const list = await listRows(ctx, TABLES.game_rounds, 100);
-  const history = (list.rows || []).filter(x => (x.gameId || x.game_id) === 'tiger' && x.status === 'settled').sort((a, b) => String(b.period).localeCompare(String(a.period))).slice(0, 50).map(x => { const r = parseResult(x.resultJson) || {}; return { period: x.period, winner: r.winner || 'Tie' }; });
+  const history = (list.rows || []).filter(x => (x.gameId || x.game_id) === 'tiger' && x.status === 'settled').sort((a, b) => String(b.period).localeCompare(String(a.period))).slice(0, 50).map(x => { const r = parseResult(x.resultJson || x.result_json) || {}; return { period: x.period, winner: r.winner || 'Tie' }; });
   return { history };
 }
 
@@ -201,7 +216,7 @@ async function actionSubmitDeposit(ctx, data) {
   if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000 || !utr) throw new Error('Invalid deposit request.');
   const user = await getUser(ctx, uid); const txId = `tx_${randomId()}`;
   return createRow(ctx, TABLES.transactions, {
-    userId: uid, username: user.name || user.username || 'Gamer', type: 'Deposit', amount, utr, status: 'Pending'
+    userId: uid, user_id: uid, username: user.name || user.username || 'Gamer', type: 'Deposit', amount, utr, status: 'Pending'
   }, txId);
 }
 
@@ -212,13 +227,13 @@ async function actionRequestWithdrawal(ctx, data) {
   const newBalance = money(Number(user.balance) - amount); await updateRow(ctx, TABLES.users, uid, { balance: newBalance });
   const txId = `tx_${randomId()}`;
   return createRow(ctx, TABLES.transactions, {
-    userId: uid, username: user.name || user.username || 'Gamer', type: 'Withdraw', amount, details, status: 'Pending'
+    userId: uid, user_id: uid, username: user.name || user.username || 'Gamer', type: 'Withdraw', amount, method, details, status: 'Pending'
   }, txId);
 }
 
 async function actionAdminListUsers(ctx) {
   await requireAdmin(ctx); const rows = await listAllRows(ctx, TABLES.users);
-  return { users: rows.map(x => ({ id: x.$id, uid: x.uid || x.$id, username: x.name || x.username || 'Gamer', phone: x.phone || '', balance: Number(x.balance || 0), depositBalance: Number(x.depositBalance || 0), winningBalance: Number(x.winningBalance || 0) })) };
+  return { users: rows.map(x => ({ id: x.$id, uid: x.uid || x.$id, username: x.name || x.username || 'Gamer', phone: x.phone || '', balance: Number(x.balance || 0), depositBalance: Number(x.depositBalance || x.deposit_balance || 0), winningBalance: Number(x.winningBalance || x.winning_balance || 0) })) };
 }
 
 async function actionAdminAddMoney(ctx, data) {
@@ -231,7 +246,7 @@ async function actionAdminAddMoney(ctx, data) {
   }
   if (!target) throw new Error('User not found.');
   const newBalance = money(Number(target.balance || 0) + amount);
-  return updateRow(ctx, TABLES.users, target.$id, { balance: newBalance, depositBalance: money(Number(target.depositBalance || 0) + amount) });
+  return updateRow(ctx, TABLES.users, target.$id, { balance: newBalance, depositBalance: money(Number(target.depositBalance || target.deposit_balance || 0) + amount) });
 }
 
 async function actionAdminListTransactions(ctx) {
@@ -244,7 +259,7 @@ async function actionApproveTransaction(ctx, data) {
   if (!txId || data.decision !== 'approve') throw new Error('Only approve is supported.');
   const tx = await getRow(ctx, TABLES.transactions, txId); if (tx.status !== 'Pending') return tx;
   const user = await getUser(ctx, tx.userId || tx.user_id);
-  if (tx.type === 'Deposit') { const amount = money(tx.amount); await updateRow(ctx, TABLES.users, tx.userId || tx.user_id, { balance: money(Number(user.balance || 0) + amount), depositBalance: money(Number(user.depositBalance || 0) + amount) }); }
+  if (tx.type === 'Deposit') { const amount = money(tx.amount); await updateRow(ctx, TABLES.users, tx.userId || tx.user_id, { balance: money(Number(user.balance || 0) + amount), depositBalance: money(Number(user.depositBalance || user.deposit_balance || 0) + amount) }); }
   return updateRow(ctx, TABLES.transactions, txId, { status: 'Approved' });
 }
 
