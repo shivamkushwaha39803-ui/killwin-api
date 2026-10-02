@@ -1,15 +1,16 @@
 {
-  "name": "wingo-game-backend",
+  "name": "indian-club-game-backend",
   "version": "1.0.0",
-  "description": "Appwrite WinGo Game Server",
-  "main": "index.js",
+  "description": "Backend for Indian Club Game",
+  "main": "src/main.js",
+  "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node src/main.js"
   },
   "dependencies": {
-    "node-appwrite": "^14.1.0",
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5"
+    "node-appwrite": "^14.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
