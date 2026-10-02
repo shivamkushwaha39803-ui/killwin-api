@@ -1,519 +1,1328 @@
-import { Client, Databases, Users, ID, Query } from 'node-appwrite';
-
-// ==================== CONFIG ====================
+const PROJECT_ID = process.env.APPWRITE_FUNCTION_PROJECT_ID || '6ab2b71c00171587d4fc';
 const DATABASE_ID = process.env.APPWRITE_DATABASE_ID || '6ab2bdb4000c76cc3bef';
+const ENDPOINT = process.env.APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1';
 
-// Collection IDs (Aapke existing collections)
-const COL = {
-  ADMINS: 'admins',
-  BETS: 'bets',
-  CONFIG: 'config',
-  GAME_HISTORY: 'game_history',
-  GAME_ROUNDS: 'game_rounds',
-  SETTING: 'setting',
-  USERS: 'users',
-  TRANSACTIONS: 'transactions',
-  WINGO_ROUNDS: 'wingo_rounds'
+const TABLES = {
+  users: process.env.USERS_TABLE_ID || '6ab2bf1d0025b9c53f38',
+  admins: process.env.ADMINS_TABLE_ID || '6ab34851002ce1959b05',
+  config: process.env.CONFIG_TABLE_ID || '6ab348cb001698034464',
+  game_rounds: process.env.GAME_ROUNDS_TABLE_ID || '6ab349bd001c6378143a',
+  transactions: process.env.TRANSACTIONS_TABLE_ID || 'transactions',
+  bets: process.env.BETS_TABLE_ID || '6ab34ddf001d569d3f06'
 };
 
-// ==================== ADMIN EMAILS ====================
-// Aapka email yahan add kiya gaya hai
-const ADMIN_EMAILS = [
-  'parikushwaha7019@gmail.com',
-  'admin@killwinapp.com',
-  '9833381519@killwinapp.com'
-];
+const FEE = 0.02;
 
-// ==================== CLIENT ====================
-function getClient() {
-  return new Client()
-    .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT || 'https://cloud.appwrite.io/v1')
-    .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-    .setKey(process.env.APPWRITE_API_KEY);
-}
-const getDb = () => new Databases(getClient());
-const getUsers = () => new Users(getClient());
-
-// ==================== MAIN HANDLER ====================
-export default async ({ req, res, log, error }) => {
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Appwrite-User-Id',
-  };
-
-  if (req.method === 'OPTIONS') return res.send('', 204, corsHeaders);
-
-  let body = {};
-  try {
-    body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-  } catch (e) {
-    return res.json({ error: 'Invalid JSON' }, 400, corsHeaders);
-  }
-
-  const { action, data = {} } = body;
-  const userId = req.headers['x-appwrite-user-id'] || data.userId || null;
-
-  log(`[${action}] userId=${userId}`);
-
-  try {
-    let result;
-    switch (action) {
-      // PROFILE
-      case 'createProfile': result = await createProfile(userId, data, log); break;
-      case 'getProfile': result = await getProfile(userId, log); break;
-
-      // GAME ROUNDS
-      case 'ensureGameRound': result = await ensureGameRound(data.gameId, log); break;
-      case 'getWingoHistory': result = await getWingoHistory(log); break;
-
-      // BETTING
-      case 'placeGameBet': result = await placeGameBet(userId, data, log); break;
-
-      // WALLET
-      case 'submitDeposit': result = await submitDeposit(userId, data, log); break;
-      case 'requestWithdrawal': result = await requestWithdrawal(userId, data, log); break;
-
-      // CONFIG
-      case 'getPlatformConfig': result = await getPlatformConfig(log); break;
-      case 'setPlatformConfig': result = await setPlatformConfig(userId, data, log); break;
-
-      // ADMIN
-      case 'verifyAdmin': result = await verifyAdmin(userId, log); break;
-      case 'adminListUsers': result = await adminListUsers(log); break;
-      case 'adminListTransactions': result = await adminListTransactions(log); break;
-      case 'adminAddMoney': result = await adminAddMoney(data, log); break;
-      case 'approveTransaction': result = await approveTransaction(data, log); break;
-      case 'setAdminControl': result = await setAdminControl(data, log); break;
-
-      default:
-        return res.json({ error: `Unknown action: ${action}` }, 400, corsHeaders);
-    }
-    return res.json({ data: result }, 200, corsHeaders);
-  } catch (err) {
-    error(`[${action}] ${err.message}`);
-    return res.json({ error: err.message }, 500, corsHeaders);
-  }
+const GAME_RULES = {
+  wingo: { seconds: 30 },
+  tiger: { seconds: 30 },
+  number100: { seconds: 300 }
 };
 
-// ==================== PROFILE ====================
-async function createProfile(userId, data, log) {
-  if (!userId) throw new Error('User ID required');
-  const db = getDb();
-  const { username, phone } = data;
+function nowMs() {
+  return Date.now();
+}
 
-  try {
-    const existing = await db.listDocuments(DATABASE_ID, COL.USERS, [
-      Query.equal('uid', userId), Query.limit(1)
-    ]);
+function money(n) {
+  return Math.round(Number(n || 0) * 100) / 100;
+}
 
-    if (existing.documents.length > 0) {
-      return formatUser(existing.documents[0]);
-    }
-  } catch (e) {
-    log(`Check existing failed: ${e.message}`);
+function enc(s) {
+  return encodeURIComponent(String(s));
+}
+
+function uidFrom(ctx) {
+  const h = ctx?.req?.headers || {};
+
+  return (
+    h['x-appwrite-user-id'] ||
+    h['X-Appwrite-User-Id'] ||
+    process.env.APPWRITE_FUNCTION_USER_ID ||
+    ''
+  );
+}
+
+function keyFrom(ctx) {
+  const h = ctx?.req?.headers || {};
+
+  return (
+    h['x-appwrite-key'] ||
+    h['X-Appwrite-Key'] ||
+    process.env.APPWRITE_FUNCTION_API_KEY ||
+    ''
+  );
+}
+
+function randomId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
+}
+
+/* =========================================================
+   APPWRITE REST API
+========================================================= */
+
+async function api(ctx, method, path, body) {
+  const key = keyFrom(ctx);
+
+  if (!key) {
+    throw new Error(
+      'Appwrite API key missing. Add APPWRITE_FUNCTION_API_KEY to the Function.'
+    );
   }
 
-  const doc = await db.createDocument(DATABASE_ID, COL.USERS, ID.unique(), {
-    uid: userId,
-    username: username || 'Gamer',
-    name: username || 'Gamer',
-    phone: phone || '',
-    balance: 0,
-    depositBalance: 0,
-    winningBalance: 0,
-    status: 'active',
-    upi_id: '',
-    createdAt: new Date().toISOString()
+  const headers = {
+    'X-Appwrite-Project': PROJECT_ID,
+    'X-Appwrite-Key': key,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  const res = await fetch(`${ENDPOINT}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body)
   });
 
-  return formatUser(doc);
-}
+  const text = await res.text();
 
-async function getProfile(userId, log) {
-  if (!userId) throw new Error('Not authenticated');
-  const db = getDb();
+  let data = {};
 
-  const result = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.equal('uid', userId), Query.limit(1)
-  ]);
-
-  if (result.documents.length === 0) {
-    return await createProfile(userId, { username: 'Gamer' }, log);
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (_) {
+    data = { message: text };
   }
-  return formatUser(result.documents[0]);
+
+  if (!res.ok) {
+    const e = new Error(
+      data.message ||
+      data.error ||
+      `Appwrite API ${res.status}`
+    );
+
+    e.status = res.status;
+    e.response = data;
+
+    throw e;
+  }
+
+  return data;
 }
 
-function formatUser(doc) {
+async function getRow(ctx, table, rowId) {
+  return api(
+    ctx,
+    'GET',
+    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows/${enc(rowId)}`
+  );
+}
+
+async function updateRow(ctx, table, rowId, data) {
+  return api(
+    ctx,
+    'PATCH',
+    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows/${enc(rowId)}/`,
+    { data }
+  );
+}
+
+async function createRow(ctx, table, data, rowId) {
+  return api(
+    ctx,
+    'POST',
+    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows`,
+    {
+      rowId: rowId || 'unique()',
+      data
+    }
+  );
+}
+
+async function upsertRow(ctx, table, rowId, data) {
+  try {
+    return await updateRow(ctx, table, rowId, data);
+  } catch (e) {
+    if (e.status !== 404) throw e;
+    return createRow(ctx, table, data, rowId);
+  }
+}
+
+async function listRows(ctx, table, limit = 100, offset = 0) {
+  const r = await api(
+    ctx,
+    'GET',
+    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows?limit=${limit}&offset=${offset}`
+  );
+
   return {
-    uid: doc.uid,
-    username: doc.username || doc.name || 'Gamer',
-    phone: doc.phone || '',
-    balance: Number(doc.balance || 0),
-    depositBalance: Number(doc.depositBalance || 0),
-    winningBalance: Number(doc.winningBalance || 0),
-    createdAt: doc.createdAt || doc.$createdAt,
-    joinDate: doc.createdAt || doc.$createdAt
+    ...r,
+    rows: Array.isArray(r.rows) ? r.rows : []
   };
 }
 
-// ==================== GAME ROUNDS ====================
-async function ensureGameRound(gameId, log) {
-  const db = getDb();
-  const durations = { wingo: 30, tiger: 30, number100: 300 };
-  const duration = durations[gameId] || 30;
-  const now = Date.now();
-  const periodNumber = Math.floor(now / (duration * 1000));
-  const period = `${gameId}_${new Date(periodNumber * duration * 1000).toISOString().replace(/[-:T.]/g, '').slice(0, 14)}`;
-  const startAtMs = periodNumber * duration * 1000;
-  const endAtMs = startAtMs + duration * 1000;
+async function listAllRows(ctx, table, pageSize = 100, maxPages = 100) {
+  const out = [];
 
-  try {
-    const existing = await db.listDocuments(DATABASE_ID, COL.GAME_ROUNDS, [
-      Query.equal('game_id', gameId),
-      Query.equal('period', period),
-      Query.limit(1)
-    ]);
+  for (let p = 0; p < maxPages; p++) {
+    const r = await listRows(
+      ctx,
+      table,
+      pageSize,
+      p * pageSize
+    );
 
-    if (existing.documents.length > 0) {
-      const r = existing.documents[0];
-      return {
-        gameId, period: r.period,
-        startAtMs: Number(r.start_at_ms || startAtMs),
-        endAtMs: Number(r.end_at_ms || endAtMs),
-        serverNowMs: now,
-        status: r.status || 'active'
-      };
+    out.push(...r.rows);
+
+    if (r.rows.length < pageSize) {
+      break;
     }
-  } catch (e) { log(`Round fetch: ${e.message}`); }
+  }
 
-  try {
-    await db.createDocument(DATABASE_ID, COL.GAME_ROUNDS, ID.unique(), {
-      game_id: gameId,
-      period,
-      start_at_ms: startAtMs,
-      end_at_ms: endAtMs,
-      status: 'active',
-      result: '',
-      color: '',
-      size: '',
-      result_json: '',
-      settled_at: null
-    });
-  } catch (e) { log(`Round create: ${e.message}`); }
-
-  return { gameId, period, startAtMs, endAtMs, serverNowMs: now, status: 'active' };
+  return out;
 }
 
-async function getWingoHistory(log) {
-  const db = getDb();
+async function safeGetRow(ctx, table, rowId) {
   try {
-    const result = await db.listDocuments(DATABASE_ID, COL.WINGO_ROUNDS, [
-      Query.orderDesc('$createdAt'),
-      Query.limit(20)
-    ]);
-
-    const history = result.documents.map(d => ({
-      period: d.period,
-      number: Number(d.number || 0),
-      color: d.color || 'green',
-      size: d.size || 'small',
-      winner: d.winner || '',
-      timestamp: d.$createdAt
-    }));
-
-    return { history };
+    return await getRow(ctx, table, rowId);
   } catch (e) {
-    log(`History error: ${e.message}`);
-    return { history: [] };
+    if (e.status === 404) return null;
+    throw e;
   }
 }
 
-// ==================== BETTING ====================
-async function placeGameBet(userId, data, log) {
-  if (!userId) throw new Error('Login required');
-  const db = getDb();
-  const { gameId, selection, category, amount } = data;
+async function safeUpdateRow(ctx, table, rowId, data) {
+  try {
+    return await updateRow(ctx, table, rowId, data);
+  } catch (e) {
+    if (e.status === 404) {
+      return createRow(ctx, table, data, rowId);
+    }
 
-  if (!gameId || !selection || !amount || amount <= 0) throw new Error('Invalid bet');
+    throw e;
+  }
+}
 
-  const profiles = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.equal('uid', userId), Query.limit(1)
-  ]);
+/* =========================================================
+   SERVER-SIDE DETERMINISTIC RESULT
+========================================================= */
 
-  if (profiles.documents.length === 0) throw new Error('Profile not found');
-  const p = profiles.documents[0];
-  const balance = Number(p.balance || 0);
-  if (balance < amount) throw new Error('Insufficient balance');
+function hashString(s) {
+  let h = 2166136261;
 
-  await db.updateDocument(DATABASE_ID, COL.USERS, p.$id, { balance: balance - amount });
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
 
-  const round = await ensureGameRound(gameId, log);
+  return h >>> 0;
+}
 
-  await db.createDocument(DATABASE_ID, COL.BETS, ID.unique(), {
-    userId,
-    gameId,
-    period: round.period,
-    selection: String(selection),
-    category: category || 'Color',
-    amount: Number(amount),
-    payout: 0,
-    status: 'pending',
-    resultJson: '',
-    settledAt: null
-  });
+function mulberry32(a) {
+  return function () {
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
 
-  return {
-    success: true,
-    newBalance: balance - amount,
-    period: round.period,
-    message: `Bet ₹${amount} on ${selection}`
+    let t = a;
+
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-// ==================== WALLET ====================
-async function submitDeposit(userId, data, log) {
-  if (!userId) throw new Error('Login required');
-  const db = getDb();
-  const { amount, utr } = data;
-  if (!amount || amount <= 0) throw new Error('Invalid amount');
-  if (!utr) throw new Error('UTR required');
-
-  const profiles = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.equal('uid', userId), Query.limit(1)
-  ]);
-  if (profiles.documents.length === 0) throw new Error('Profile not found');
-  const p = profiles.documents[0];
-
-  await db.createDocument(DATABASE_ID, COL.TRANSACTIONS, ID.unique(), {
-    user_id: userId,
-    userId,
-    username: p.username || p.name || 'Gamer',
-    type: 'Deposit',
-    amount: Number(amount),
-    utr,
-    details: `UTR: ${utr}`,
-    status: 'Pending',
-    timestamp: new Date().toLocaleString('en-IN')
-  });
-
-  return { success: true, message: 'Deposit submitted' };
+function seededInt(seed, max) {
+  return Math.floor(
+    mulberry32(hashString(String(seed)))() * max
+  );
 }
 
-async function requestWithdrawal(userId, data, log) {
-  if (!userId) throw new Error('Login required');
-  const db = getDb();
-  const { amount, method, details } = data;
-  if (!amount || amount <= 0) throw new Error('Invalid amount');
-
-  const profiles = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.equal('uid', userId), Query.limit(1)
-  ]);
-  if (profiles.documents.length === 0) throw new Error('Profile not found');
-  const p = profiles.documents[0];
-  if (Number(p.balance) < amount) throw new Error('Insufficient balance');
-
-  await db.updateDocument(DATABASE_ID, COL.USERS, p.$id, {
-    balance: Number(p.balance) - Number(amount)
-  });
-
-  await db.createDocument(DATABASE_ID, COL.TRANSACTIONS, ID.unique(), {
-    user_id: userId,
-    userId,
-    username: p.username || p.name || 'Gamer',
-    type: 'Withdraw',
-    amount: Number(amount),
-    details: `${method}: ${details}`,
-    status: 'Pending',
-    timestamp: new Date().toLocaleString('en-IN')
-  });
-
-  return { success: true, message: 'Withdrawal requested' };
+function seededChoice(seed, arr) {
+  return arr[seededInt(seed, arr.length)];
 }
 
-// ==================== CONFIG ====================
-async function getPlatformConfig(log) {
-  const db = getDb();
-  try {
-    const result = await db.listDocuments(DATABASE_ID, COL.CONFIG, [Query.limit(1)]);
-    if (result.documents.length === 0) {
-      return {
-        upiId: '9833381519@ptyes',
-        qrImgUrl: 'https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=upi://pay?pa=9833381519@ptyes'
-      };
-    }
-    const c = result.documents[0];
+/* =========================================================
+   ROUND / PERIOD
+========================================================= */
+
+function periodInfo(gameId, t = nowMs()) {
+  const seconds = GAME_RULES[gameId]?.seconds || 30;
+
+  const size = seconds * 1000;
+
+  const start = Math.floor(t / size) * size;
+
+  const end = start + size;
+
+  const d = new Date(start);
+
+  const period =
+    `${d.getUTCFullYear()}` +
+    `${String(d.getUTCMonth() + 1).padStart(2, '0')}` +
+    `${String(d.getUTCDate()).padStart(2, '0')}` +
+    `${String(d.getUTCHours()).padStart(2, '0')}` +
+    `${String(d.getUTCMinutes()).padStart(2, '0')}` +
+    `${String(d.getUTCSeconds()).padStart(2, '0')}`;
+
+  return {
+    game_id: gameId,
+    period,
+    startAtMs: start,
+    endAtMs: end
+  };
+}
+
+/* =========================================================
+   WIN GO RESULT
+========================================================= */
+
+function colorForNumber(n) {
+  if (n === 0 || n === 5) {
+    return 'violet';
+  }
+
+  return n % 2 === 0 ? 'red' : 'green';
+}
+
+function sizeForNumber(n) {
+  return n >= 5 ? 'Big' : 'Small';
+}
+
+function generateOutcome(gameId, period) {
+  if (gameId === 'wingo') {
+    const number = seededInt(period, 10);
+
     return {
-      upiId: c.upiId || '9833381519@ptyes',
-      qrImgUrl: c.qrImgUrl || ''
+      number,
+      color: colorForNumber(number),
+      size: sizeForNumber(number)
     };
-  } catch (e) {
-    log(`Config error: ${e.message}`);
-    return { upiId: '9833381519@ptyes', qrImgUrl: '' };
   }
+
+  if (gameId === 'tiger') {
+    return {
+      winner: seededChoice(
+        period,
+        ['Tiger', 'Lion', 'Tie']
+      )
+    };
+  }
+
+  if (gameId === 'number100') {
+    return {
+      number: seededInt(period, 101)
+    };
+  }
+
+  throw new Error('Unsupported game');
 }
 
-async function setPlatformConfig(userId, data, log) {
-  const db = getDb();
-  const { upiId, qrImgUrl } = data;
-  const result = await db.listDocuments(DATABASE_ID, COL.CONFIG, [Query.limit(1)]);
+/* =========================================================
+   PAYOUT
+========================================================= */
 
-  if (result.documents.length === 0) {
-    await db.createDocument(DATABASE_ID, COL.CONFIG, ID.unique(), {
-      upiId: upiId || '',
-      qrImgUrl: qrImgUrl || '',
-      key: 'platform',
-      updatedBy: userId || 'admin',
-      updatedAt: new Date().toISOString()
-    });
-  } else {
-    await db.updateDocument(DATABASE_ID, COL.CONFIG, result.documents[0].$id, {
-      upiId: upiId || '',
-      qrImgUrl: qrImgUrl || '',
-      updatedBy: userId || 'admin',
-      updatedAt: new Date().toISOString()
-    });
+function payoutMultiplier(gameId, selection, category) {
+  if (gameId === 'wingo') {
+
+    if (category === 'Color') {
+      return String(selection).toLowerCase() === 'violet'
+        ? 4.5
+        : 2;
+    }
+
+    if (category === 'Size') {
+      return 2;
+    }
+
+    if (category === 'Number') {
+      return 9;
+    }
   }
-  return { success: true };
+
+  if (gameId === 'tiger') {
+    return String(selection).toLowerCase() === 'tie'
+      ? 8
+      : 2;
+  }
+
+  if (gameId === 'number100') {
+    return 30;
+  }
+
+  return 0;
 }
 
-// ==================== ADMIN ====================
-async function verifyAdmin(userId, log) {
-  if (!userId) return { isAdmin: false };
-  const users = getUsers();
+function isWinningBet(gameId, bet, outcome) {
+
+  if (gameId === 'wingo') {
+
+    if (bet.category === 'Color') {
+      return (
+        String(bet.selection).toLowerCase() ===
+        String(outcome.color).toLowerCase()
+      );
+    }
+
+    if (bet.category === 'Size') {
+      return (
+        String(bet.selection).toLowerCase() ===
+        String(outcome.size).toLowerCase()
+      );
+    }
+
+    if (bet.category === 'Number') {
+      return (
+        Number(bet.selection) ===
+        Number(outcome.number)
+      );
+    }
+  }
+
+  if (gameId === 'tiger') {
+    return (
+      String(bet.selection).toLowerCase() ===
+      String(outcome.winner).toLowerCase()
+    );
+  }
+
+  if (gameId === 'number100') {
+    return (
+      Number(bet.selection) ===
+      Number(outcome.number)
+    );
+  }
+
+  return false;
+}
+
+function parseResult(v) {
+  if (!v) return null;
+
+  if (typeof v === 'object') {
+    return v;
+  }
+
   try {
-    const user = await users.get(userId);
-    log(`Admin check for: ${user.email}`);
-    const isAdmin = ADMIN_EMAILS.includes(user.email);
-    log(`Is admin: ${isAdmin}`);
-    return { isAdmin, email: user.email };
+    const x = JSON.parse(String(v));
+
+    return x && typeof x === 'object'
+      ? x
+      : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/* =========================================================
+   USER / ADMIN
+========================================================= */
+
+async function requireUser(ctx) {
+  const uid = uidFrom(ctx);
+
+  if (!uid) {
+    throw new Error('Login required.');
+  }
+
+  return uid;
+}
+
+async function getUser(ctx, uid) {
+  const row = await safeGetRow(
+    ctx,
+    TABLES.users,
+    uid
+  );
+
+  if (!row) {
+    throw new Error('User profile not found.');
+  }
+
+  return row;
+}
+
+function profileResponse(row) {
+  return {
+    id: row.$id,
+    uid: row.uid || row.$id,
+
+    username:
+      row.username ||
+      row.name ||
+      'Gamer',
+
+    name:
+      row.name ||
+      row.username ||
+      'Gamer',
+
+    phone: row.phone || '',
+
+    balance: Number(row.balance || 0),
+
+    depositBalance:
+      Number(row.depositBalance || 0),
+
+    winningBalance:
+      Number(row.winningBalance || 0),
+
+    createdAt:
+      row.createdAt ||
+      row.$createdAt
+  };
+}
+
+async function requireAdmin(ctx) {
+  const uid = await requireUser(ctx);
+
+  const direct = await safeGetRow(
+    ctx,
+    TABLES.admins,
+    uid
+  );
+
+  if (
+    direct &&
+    String(direct.role || 'admin')
+      .trim()
+      .toLowerCase() === 'admin' &&
+    String(
+      direct.userId ??
+      direct.user_id ??
+      direct.uid ??
+      direct.$id ??
+      ''
+    ).trim() === uid
+  ) {
+    return uid;
+  }
+
+  const rows = await listAllRows(
+    ctx,
+    TABLES.admins
+  );
+
+  const ok = rows.some(r =>
+    String(
+      r.userId ??
+      r.user_id ??
+      r.uid ??
+      r.$id ??
+      ''
+    ).trim() === uid &&
+    String(r.role || 'admin')
+      .trim()
+      .toLowerCase() === 'admin'
+  );
+
+  if (!ok) {
+    throw new Error('Admin verification failed.');
+  }
+
+  return uid;
+}
+
+/* =========================================================
+   PROFILE
+========================================================= */
+
+async function actionCreateProfile(ctx, data) {
+  const uid = await requireUser(ctx);
+
+  const existing = await safeGetRow(
+    ctx,
+    TABLES.users,
+    uid
+  );
+
+  if (existing) {
+    return profileResponse(existing);
+  }
+
+  const username =
+    String(data.username || 'Gamer')
+      .trim()
+      .slice(0, 80);
+
+  const phone =
+    String(data.phone || '')
+      .trim()
+      .slice(0, 40);
+
+  const row = await createRow(
+    ctx,
+    TABLES.users,
+    {
+      uid,
+      username,
+      name: username,
+      phone,
+
+      balance: 0,
+      depositBalance: 0,
+      winningBalance: 0,
+
+      createdAt: new Date().toISOString()
+    },
+    uid
+  );
+
+  return profileResponse(row);
+}
+
+async function actionGetProfile(ctx) {
+  return profileResponse(
+    await getUser(
+      ctx,
+      await requireUser(ctx)
+    )
+  );
+}
+
+/* =========================================================
+   PLATFORM CONFIG
+========================================================= */
+
+async function findPlatformConfigRow(ctx) {
+
+  const direct = await safeGetRow(
+    ctx,
+    TABLES.config,
+    'platform'
+  );
+
+  if (direct) {
+    return direct;
+  }
+
+  const rows = await listAllRows(
+    ctx,
+    TABLES.config
+  );
+
+  return (
+    rows.find(
+      r =>
+        String(r.key || '')
+          .trim()
+          .toLowerCase() === 'platform'
+    ) || null
+  );
+}
+
+async function actionGetPlatformConfig(ctx) {
+
+  const row =
+    await findPlatformConfigRow(ctx);
+
+  if (!row) {
+    return {
+      upiId: '',
+      qrImgUrl: '',
+      tournaments: []
+    };
+  }
+
+  let tournaments = [];
+
+  if (Array.isArray(row.tournaments)) {
+    tournaments = row.tournaments;
+  } else if (row.tournaments) {
+
+    try {
+      tournaments =
+        JSON.parse(row.tournaments);
+
+      if (!Array.isArray(tournaments)) {
+        tournaments = [];
+      }
+
+    } catch (_) {
+      tournaments = [];
+    }
+  }
+
+  return {
+    upiId: String(row.upiId || ''),
+    qrImgUrl: String(row.qrImgUrl || ''),
+    tournaments
+  };
+}
+
+async function actionSetPlatformConfig(ctx, data) {
+
+  const uid = await requireAdmin(ctx);
+
+  const row =
+    await findPlatformConfigRow(ctx);
+
+  const payload = {};
+
+  if (data.upiId !== undefined) {
+    payload.upiId =
+      String(data.upiId || '').trim();
+  }
+
+  if (data.qrImgUrl !== undefined) {
+    payload.qrImgUrl =
+      String(data.qrImgUrl || '').trim();
+  }
+
+  payload.updatedAt =
+    new Date().toISOString();
+
+  payload.updatedBy = uid;
+
+  const saved = row
+    ? await updateRow(
+        ctx,
+        TABLES.config,
+        row.$id,
+        payload
+      )
+    : await createRow(
+        ctx,
+        TABLES.config,
+        {
+          key: 'platform',
+          ...payload
+        },
+        'platform'
+      );
+
+  return {
+    ok: true,
+
+    config: {
+      upiId:
+        String(saved.upiId || ''),
+
+      qrImgUrl:
+        String(saved.qrImgUrl || '')
+    }
+  };
+}
+
+/* =========================================================
+   ADMIN DIRECT RESULT OVERRIDE ENDPOINT (Appwrite Synced)
+========================================================= */
+
+async function actionSetGameResultOverride(ctx, data) {
+  await requireAdmin(ctx);
+
+  const gameId = String(data.game_id || data.gameId || 'wingo').trim();
+  if (!GAME_RULES[gameId]) throw new Error('Unsupported gameId.');
+
+  const current = periodInfo(gameId);
+  const roundId = `${gameId}_${current.period}`;
+
+  let outcome = {};
+
+  if (gameId === 'wingo') {
+    const num = Number(data.number ?? 0);
+    outcome = {
+      number: num,
+      color: colorForNumber(num),
+      size: sizeForNumber(num)
+    };
+  } else if (gameId === 'tiger') {
+    outcome = {
+      winner: String(data.winner || 'Tiger').trim()
+    };
+  } else if (gameId === 'number100') {
+    outcome = {
+      number: Number(data.number ?? 0)
+    };
+  }
+
+  const payload = {
+    game_id: gameId,
+    period: current.period,
+    status: 'open',
+    start_at_ms: current.startAtMs,
+    end_at_ms: current.endAtMs,
+    result_json: JSON.stringify(outcome),
+    result: String(outcome.number ?? outcome.winner ?? ''),
+    color: outcome.color || '',
+    size: outcome.size || ''
+  };
+
+  const updated = await upsertRow(ctx, TABLES.game_rounds, roundId, payload);
+
+  return {
+    ok: true,
+    roundId,
+    outcome,
+    updated
+  };
+}
+
+/* =========================================================
+   TOURNAMENTS
+========================================================= */
+
+async function actionGetTournaments(ctx) {
+  const config =
+    await actionGetPlatformConfig(ctx);
+
+  return config.tournaments || [];
+}
+
+async function actionSetTournaments(ctx, data) {
+
+  await requireAdmin(ctx);
+
+  const row =
+    await findPlatformConfigRow(ctx);
+
+  const tournaments =
+    Array.isArray(data.tournaments)
+      ? data.tournaments
+      : [];
+
+  const payload = {
+    tournaments,
+
+    updatedAt:
+      new Date().toISOString(),
+
+    updatedBy:
+      uidFrom(ctx)
+  };
+
+  const saved = row
+    ? await updateRow(
+        ctx,
+        TABLES.config,
+        row.$id,
+        payload
+      )
+    : await createRow(
+        ctx,
+        TABLES.config,
+        {
+          key: 'platform',
+          upiId: '',
+          qrImgUrl: '',
+          ...payload
+        },
+        'platform'
+      );
+
+  return {
+    ok: true,
+
+    tournaments:
+      Array.isArray(saved.tournaments)
+        ? saved.tournaments
+        : tournaments
+  };
+}
+
+/* =========================================================
+   ENSURE GAME ROUND
+========================================================= */
+
+async function actionEnsureGameRound(ctx, data) {
+
+  const gameId =
+    String(
+      data.game_id ||
+      data.gameId ||
+      ''
+    ).trim();
+
+  if (!GAME_RULES[gameId]) {
+    throw new Error(
+      'Unsupported gameId.'
+    );
+  }
+
+  const current =
+    periodInfo(gameId);
+
+  const roundId =
+    `${gameId}_${current.period}`;
+
+  let round =
+    await safeGetRow(
+      ctx,
+      TABLES.game_rounds,
+      roundId
+    );
+
+  if (!round) {
+
+    const outcome =
+      generateOutcome(
+        gameId,
+        current.period
+      );
+
+    round =
+      await createRow(
+        ctx,
+        TABLES.game_rounds,
+        {
+          game_id: gameId,
+          period: current.period,
+
+          status: 'open',
+
+          start_at_ms:
+            current.startAtMs,
+
+          end_at_ms:
+            current.endAtMs,
+
+          result_json:
+            JSON.stringify(outcome),
+
+          result:
+            String(
+              outcome.number ??
+              outcome.winner ??
+              ''
+            ),
+
+          color:
+            outcome.color || '',
+
+          size:
+            outcome.size || ''
+        },
+        roundId
+      );
+  }
+
+  const prev =
+    periodInfo(
+      gameId,
+      current.startAtMs - 1
+    );
+
+  const prevId =
+    `${gameId}_${prev.period}`;
+
+  const prevRow =
+    await safeGetRow(
+      ctx,
+      TABLES.game_rounds,
+      prevId
+    );
+
+  if (
+    prevRow &&
+    prevRow.status !== 'settled' &&
+    Number(prevRow.end_at_ms) <= nowMs()
+  ) {
+
+    try {
+
+      await settleRoundInternal(
+        ctx,
+        gameId,
+        prev.period
+      );
+
+    } catch (e) {
+
+      try {
+        ctx.error?.(
+          `Auto settlement ${gameId}/${prev.period}: ${e.message}`
+        );
+      } catch (_) {}
+    }
+  }
+
+  return {
+    ...periodInfo(gameId),
+
+    roundId,
+
+    serverNowMs:
+      nowMs(),
+
+    status:
+      round.status,
+
+    result:
+      parseResult(
+        round.result_json
+      )
+  };
+}
+
+/* =========================================================
+   PLACE BET
+========================================================= */
+
+async function actionPlaceGameBet(ctx, data) {
+
+  const uid =
+    await requireUser(ctx);
+
+  const gameId =
+    String(
+      data.game_id ||
+      data.gameId ||
+      ''
+    ).trim();
+
+  const category =
+    String(
+      data.category || ''
+    ).trim();
+
+  const selection =
+    String(
+      data.selection ?? ''
+    ).trim();
+
+  const amount =
+    money(data.amount);
+
+  if (
+    !GAME_RULES[gameId] ||
+    !selection ||
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    throw new Error('Invalid bet.');
+  }
+
+  const round =
+    periodInfo(gameId);
+
+  if (
+    nowMs() >
+    round.endAtMs - 5000
+  ) {
+    throw new Error(
+      'Betting is closed for this round.'
+    );
+  }
+
+  const multiplier =
+    payoutMultiplier(
+      gameId,
+      selection,
+      category
+    );
+
+  if (multiplier <= 0) {
+    throw new Error(
+      'Invalid selection/category.'
+    );
+  }
+
+  const user =
+    await getUser(ctx, uid);
+
+  if (
+    money(user.balance) <
+    amount
+  ) {
+    throw new Error(
+      'Insufficient balance.'
+    );
+  }
+
+  await updateRow(
+    ctx,
+    TABLES.users,
+    uid,
+    {
+      balance:
+        money(
+          Number(user.balance) -
+          amount
+        )
+    }
+  );
+
+  const betId =
+    `bet_${randomId()}`;
+
+  return createRow(
+    ctx,
+    TABLES.bets,
+    {
+      userId: uid,
+
+      gameId,
+
+      period:
+        round.period,
+
+      selection,
+
+      category,
+
+      amount,
+
+      status: 'open',
+
+      payout: 0,
+
+      multiplier,
+
+      createdAt:
+        new Date().toISOString()
+    },
+    betId
+  );
+}
+
+/* =========================================================
+   SETTLE ROUND (Completed Routine)
+========================================================= */
+
+async function settleRoundInternal(
+  ctx,
+  gameId,
+  period
+) {
+
+  const roundId =
+    `${gameId}_${period}`;
+
+  const round =
+    await safeGetRow(
+      ctx,
+      TABLES.game_rounds,
+      roundId
+    );
+
+  if (!round) {
+    return {
+      settled: false,
+      reason: 'round_not_found'
+    };
+  }
+
+  if (round.status === 'settled') {
+    return {
+      settled: true,
+      period,
+      ...(parseResult(
+        round.result_json
+      ) || {}),
+      settledBets: []
+    };
+  }
+
+  if (
+    Number(round.end_at_ms) >
+    nowMs()
+  ) {
+    return {
+      settled: false,
+      reason: 'round_still_open'
+    };
+  }
+
+  const outcome =
+    parseResult(
+      round.result_json
+    ) ||
+    generateOutcome(
+      gameId,
+      period
+    );
+
+  try {
+
+    await updateRow(
+      ctx,
+      TABLES.game_rounds,
+      roundId,
+      {
+        status: 'settling'
+      }
+    );
+
   } catch (e) {
-    log(`verifyAdmin: ${e.message}`);
-    return { isAdmin: false };
+
+    const latest =
+      await safeGetRow(
+        ctx,
+        TABLES.game_rounds,
+        roundId
+      );
+
+    if (
+      latest?.status ===
+      'settled'
+    ) {
+      return {
+        settled: true,
+        period,
+        ...(parseResult(
+          latest.result_json
+        ) || {}),
+        settledBets: []
+      };
+    }
+
+    throw e;
   }
-}
 
-async function adminListUsers(log) {
-  const db = getDb();
-  const result = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.orderDesc('$createdAt'), Query.limit(100)
-  ]);
-  const users = result.documents.map(formatUser);
-  return { users };
-}
+  const allBets =
+    await listAllRows(
+      ctx,
+      TABLES.bets
+    );
 
-async function adminListTransactions(log) {
-  const db = getDb();
-  const result = await db.listDocuments(DATABASE_ID, COL.TRANSACTIONS, [
-    Query.orderDesc('$createdAt'), Query.limit(100)
-  ]);
-  const transactions = result.documents.map(t => ({
-    id: t.$id,
-    userId: t.userId || t.user_id,
-    username: t.username,
-    type: t.type,
-    amount: Number(t.amount || 0),
-    details: t.details || t.utr || '',
-    status: t.status,
-    timestamp: t.timestamp || t.$createdAt
-  }));
-  return { transactions };
-}
+  const bets =
+    allBets.filter(
+      b =>
+        String(
+          b.gameId ||
+          b.game_id
+        ) === gameId &&
 
-async function adminAddMoney(data, log) {
-  const db = getDb();
-  const { userQuery, amount } = data;
-  if (!userQuery || !amount || amount <= 0) throw new Error('Invalid data');
+        String(b.period) ===
+        period &&
 
-  const profiles = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.or([
-      Query.equal('phone', userQuery),
-      Query.equal('uid', userQuery)
-    ]), Query.limit(1)
-  ]);
+        String(b.status) ===
+        'open'
+    );
 
-  if (profiles.documents.length === 0) throw new Error('User not found');
-  const p = profiles.documents[0];
+  const settledBets = [];
 
-  await db.updateDocument(DATABASE_ID, COL.USERS, p.$id, {
-    balance: Number(p.balance || 0) + Number(amount),
-    depositBalance: Number(p.depositBalance || 0) + Number(amount)
-  });
+  for (const bet of bets) {
 
-  await db.createDocument(DATABASE_ID, COL.TRANSACTIONS, ID.unique(), {
-    user_id: p.uid,
-    userId: p.uid,
-    username: p.username,
-    type: 'AdminAdd',
-    amount: Number(amount),
-    details: 'Admin added money',
-    status: 'Completed',
-    timestamp: new Date().toLocaleString('en-IN')
-  });
+    const win =
+      isWinningBet(
+        gameId,
+        {
+          ...bet,
+          selection: bet.selection,
+          category: bet.category
+        },
+        outcome
+      );
 
-  return { success: true };
-}
+    let payout = 0;
 
-async function approveTransaction(data, log) {
-  const db = getDb();
-  const { txId, decision } = data;
-  if (!txId) throw new Error('txId required');
+    if (win) {
+      const gross = money(Number(bet.amount || 0) * Number(bet.multiplier || 1));
+      payout = money(gross * (1 - FEE));
+    }
 
-  const tx = await db.getDocument(DATABASE_ID, COL.TRANSACTIONS, txId);
-  if (tx.status !== 'Pending') throw new Error('Already processed');
+    await updateRow(
+      ctx,
+      TABLES.bets,
+      bet.$id,
+      {
+        status: win ? 'won' : 'lost',
+        payout
+      }
+    );
 
-  if (decision === 'approve') {
-    if (tx.type === 'Deposit') {
-      const profiles = await db.listDocuments(DATABASE_ID, COL.USERS, [
-        Query.equal('uid', tx.userId || tx.user_id), Query.limit(1)
-      ]);
-      if (profiles.documents.length > 0) {
-        const p = profiles.documents[0];
-        await db.updateDocument(DATABASE_ID, COL.USERS, p.$id, {
-          balance: Number(p.balance || 0) + Number(tx.amount),
-          depositBalance: Number(p.depositBalance || 0) + Number(tx.amount)
+    if (win && payout > 0 && bet.userId) {
+      const user = await safeGetRow(ctx, TABLES.users, bet.userId);
+      if (user) {
+        const curBal = Number(user.balance || 0);
+        const curWin = Number(user.winningBalance || 0);
+
+        await updateRow(ctx, TABLES.users, bet.userId, {
+          balance: money(curBal + payout),
+          winningBalance: money(curWin + payout)
         });
       }
     }
-    await db.updateDocument(DATABASE_ID, COL.TRANSACTIONS, txId, { status: 'Approved' });
-  } else {
-    if (tx.type === 'Withdraw') {
-      const profiles = await db.listDocuments(DATABASE_ID, COL.USERS, [
-        Query.equal('uid', tx.userId || tx.user_id), Query.limit(1)
-      ]);
-      if (profiles.documents.length > 0) {
-        const p = profiles.documents[0];
-        await db.updateDocument(DATABASE_ID, COL.USERS, p.$id, {
-          balance: Number(p.balance || 0) + Number(tx.amount)
-        });
-      }
-    }
-    await db.updateDocument(DATABASE_ID, COL.TRANSACTIONS, txId, { status: 'Rejected' });
-  }
-  return { success: true };
-}
 
-async function setAdminControl(data, log) {
-  const db = getDb();
-  const { controls } = data;
-
-  const result = await db.listDocuments(DATABASE_ID, COL.SETTING, [
-    Query.equal('key', 'admin_controls'), Query.limit(1)
-  ]);
-
-  const value = JSON.stringify({
-    wingo: controls.wingo || 'auto',
-    tiger: controls.tiger || 'auto',
-    number100: controls.number100 !== undefined ? controls.number100 : 'auto',
-    updatedAt: new Date().toISOString()
-  });
-
-  if (result.documents.length === 0) {
-    await db.createDocument(DATABASE_ID, COL.SETTING, ID.unique(), {
-      key: 'admin_controls', value
+    settledBets.push({
+      betId: bet.$id,
+      userId: bet.userId,
+      win,
+      payout
     });
-  } else {
-    await db.updateDocument(DATABASE_ID, COL.SETTING, result.documents[0].$id, { value });
   }
-  return { success: true };
+
+  await updateRow(
+    ctx,
+    TABLES.game_rounds,
+    roundId,
+    {
+      status: 'settled',
+      result_json: JSON.stringify(outcome)
+    }
+  );
+
+  return {
+    settled: true,
+    period,
+    outcome,
+    settledBets
+  };
 }
+
+/* =========================================================
+   MAIN APPWRITE ROUTER HANDLER
+========================================================= */
+
+module.exports = async function (ctx) {
+  try {
+    let reqData = {};
+
+    if (ctx.req?.body) {
+      try {
+        reqData = typeof ctx.req.body === 'string' ? JSON.parse(ctx.req.body) : ctx.req.body;
+      } catch (_) {
+        reqData = {};
+      }
+    }
+
+    const action = reqData.action || ctx.req?.query?.action || 'ensureGameRound';
+
+    let result = null;
+
+    switch (action) {
+      case 'createProfile':
+        result = await actionCreateProfile(ctx, reqData);
+        break;
+      case 'getProfile':
+        result = await actionGetProfile(ctx);
+        break;
+      case 'getPlatformConfig':
+        result = await actionGetPlatformConfig(ctx);
+        break;
+      case 'setPlatformConfig':
+        result = await actionSetPlatformConfig(ctx, reqData);
+        break;
+      case 'getTournaments':
+        result = await actionGetTournaments(ctx);
+        break;
+      case 'setTournaments':
+        result = await actionSetTournaments(ctx, reqData);
+        break;
+      case 'ensureGameRound':
+        result = await actionEnsureGameRound(ctx, reqData);
+        break;
+      case 'placeGameBet':
+        result = await actionPlaceGameBet(ctx, reqData);
+        break;
+      case 'overrideResult':
+      case 'setGameResultOverride':
+        result = await actionSetGameResultOverride(ctx, reqData);
+        break;
+      default:
+        result = await actionEnsureGameRound(ctx, reqData);
+        break;
+    }
+
+    return ctx.res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    return ctx.res.json({
+      success: false,
+      error: err.message || 'Server error'
+    }, err.status || 500);
+  }
+};
