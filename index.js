@@ -16,8 +16,10 @@ const COL = {
   WINGO_ROUNDS: 'wingo_rounds'
 };
 
-// Admin emails
+// ==================== ADMIN EMAILS ====================
+// Aapka email yahan add kiya gaya hai
 const ADMIN_EMAILS = [
+  'parikushwaha7019@gmail.com',
   'admin@killwinapp.com',
   '9833381519@killwinapp.com'
 ];
@@ -100,13 +102,16 @@ async function createProfile(userId, data, log) {
   const db = getDb();
   const { username, phone } = data;
 
-  // Check existing
-  const existing = await db.listDocuments(DATABASE_ID, COL.USERS, [
-    Query.equal('uid', userId), Query.limit(1)
-  ]);
+  try {
+    const existing = await db.listDocuments(DATABASE_ID, COL.USERS, [
+      Query.equal('uid', userId), Query.limit(1)
+    ]);
 
-  if (existing.documents.length > 0) {
-    return formatUser(existing.documents[0]);
+    if (existing.documents.length > 0) {
+      return formatUser(existing.documents[0]);
+    }
+  } catch (e) {
+    log(`Check existing failed: ${e.message}`);
   }
 
   const doc = await db.createDocument(DATABASE_ID, COL.USERS, ID.unique(), {
@@ -241,13 +246,10 @@ async function placeGameBet(userId, data, log) {
   const balance = Number(p.balance || 0);
   if (balance < amount) throw new Error('Insufficient balance');
 
-  // Deduct
   await db.updateDocument(DATABASE_ID, COL.USERS, p.$id, { balance: balance - amount });
 
-  // Get round
   const round = await ensureGameRound(gameId, log);
 
-  // Save bet
   await db.createDocument(DATABASE_ID, COL.BETS, ID.unique(), {
     userId,
     gameId,
@@ -381,7 +383,9 @@ async function verifyAdmin(userId, log) {
   const users = getUsers();
   try {
     const user = await users.get(userId);
+    log(`Admin check for: ${user.email}`);
     const isAdmin = ADMIN_EMAILS.includes(user.email);
+    log(`Is admin: ${isAdmin}`);
     return { isAdmin, email: user.email };
   } catch (e) {
     log(`verifyAdmin: ${e.message}`);
