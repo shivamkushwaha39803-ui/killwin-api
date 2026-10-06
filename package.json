@@ -1,16 +1,13 @@
 {
   "name": "indian-club-game-backend",
   "version": "1.0.0",
-  "description": "Backend for Indian Club Game",
+  "description": "Indian Club Game Appwrite backend",
   "main": "index.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
-    "node-appwrite": "^14.0.0"
-  },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "18.x"
   }
 }
