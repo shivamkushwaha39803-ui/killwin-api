@@ -5,6 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
  * Function ID: 6ab37be2001d71ca80d3
  * Scope: Free Fire tournaments + wallet/admin only.
  * WinGo / Colour Trading / Tiger-Lion / 0-100 game logic is intentionally NOT included.
+ * Fixed for current TablesDB query handling and the current transactions/config schema.
  */
 
 const PROJECT_ID =
@@ -227,7 +228,7 @@ async function listAllRows(tableId, baseQueries = [], maxRows = 5000) {
     while (rows.length < maxRows && guard < 100) {
         guard += 1;
 
-        const queries = [...baseQueries, queryString("limit", "", [100])];
+        const queries = [...baseQueries];
         if (cursor) {
             queries.push(queryString("cursorAfter", "", [cursor]));
         }
@@ -236,7 +237,9 @@ async function listAllRows(tableId, baseQueries = [], maxRows = 5000) {
         const batch = Array.isArray(result?.rows) ? result.rows : [];
         rows.push(...batch);
 
-        if (batch.length < 100) break;
+        // TablesDB defaults list responses to 25 rows when no limit query is
+        // supplied. Using the default avoids the empty-column pagination bug.
+        if (batch.length < 25) break;
         cursor = batch[batch.length - 1]?.$id;
         if (!cursor) break;
     }
@@ -345,10 +348,10 @@ async function withDbTransaction(work, ttl = 60) {
 }
 
 async function findOne(tableId, queries) {
-    const result = await listRows(tableId, [
-        ...queries,
-        queryString("limit", "", [1])
-    ]);
+    // Appwrite already limits listRows responses by default. Avoid adding an
+    // empty-column pagination query because some TablesDB deployments reject
+    // an omitted column as Attribute not found in schema: "".
+    const result = await listRows(tableId, queries);
     return Array.isArray(result?.rows) && result.rows.length
         ? result.rows[0]
         : null;
@@ -372,7 +375,7 @@ async function findAdminByUid(uid) {
     if (byUserId) return byUserId;
 
     return findOne(TABLES.admins, [
-        queryString("equal", "user_id", [uid])
+        queryString("equal", "userId", [uid])
     ]);
 }
 
@@ -517,17 +520,29 @@ async function getPlatformConfigRow() {
         if (err?.status !== 404) throw err;
     }
 
-    const rows = await listRows(TABLES.config, [
-        queryString("limit", "", [1])
-    ]);
+    const rows = await listRows(TABLES.config, []);
     return Array.isArray(rows?.rows) && rows.rows.length ? rows.rows[0] : null;
+}
+
+function readTournamentArray(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== "string" || !value.trim()) return [];
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function writeTournamentArray(value) {
+    return JSON.stringify(Array.isArray(value) ? value : []);
 }
 
 async function getTournamentState() {
     const config = await getPlatformConfigRow();
-    const configTournaments = Array.isArray(config?.tournaments)
-        ? config.tournaments.map((t) => normalizeTournament(t))
-        : [];
+    const configTournaments = readTournamentArray(config?.tournaments)
+        .map((t) => normalizeTournament(t));
 
     const tableRows = await listAllRows(TABLES.tournaments, [], 100);
     const tableTournaments = tableRows
@@ -799,7 +814,7 @@ async function actionSetPlatformConfig(req, data) {
             qrImgUrl,
             updatedAt: nowIso(),
             updatedBy: uid,
-            tournaments: []
+            tournaments: writeTournamentArray([])
         });
     }
 
@@ -956,14 +971,14 @@ async function actionSetTournaments(req, data) {
             qrImgUrl: platform?.qrImgUrl ?? DEFAULT_QR_URL,
             updatedAt: nowIso(),
             updatedBy: uid,
-            tournaments: adminTournaments
+            tournaments: writeTournamentArray(adminTournaments)
         };
 
         if (platform) {
             await updateRow(
                 TABLES.config,
                 platform.$id,
-                { tournaments: adminTournaments, updatedAt: nowIso(), updatedBy: uid },
+                { tournaments: writeTournamentArray(adminTournaments), updatedAt: nowIso(), updatedBy: uid },
                 transactionId
             );
         } else {
@@ -1127,13 +1142,12 @@ async function actionJoinTournament(req, data) {
 
         // If an older transaction row was created without joinKey, also inspect
         // the user/tournament identity encoded in details.
-        const oldJoins = await listRows(TABLES.transactions, [
+        const oldJoins = await listAllRows(TABLES.transactions, [
             queryString("equal", "user_id", [uid]),
-            queryString("equal", "type", ["Tournament"]),
-            queryString("limit", "", [100])
-        ]);
+            queryString("equal", "type", ["Tournament"])
+        ], 5000);
 
-        const duplicateOldJoin = (oldJoins?.rows || []).find((row) => {
+        const duplicateOldJoin = oldJoins.find((row) => {
             const d = String(row.details || "");
             return (
                 d.includes(`Tournament ID: ${tournamentId}`) &&
@@ -1163,9 +1177,8 @@ async function actionJoinTournament(req, data) {
         const platform = state.config;
         if (platform) {
             const latestConfig = await getRow(TABLES.config, platform.$id);
-            const latestArray = Array.isArray(latestConfig?.tournaments)
-                ? latestConfig.tournaments.map((t) => normalizeTournament(t))
-                : [];
+            const latestArray = readTournamentArray(latestConfig?.tournaments)
+                .map((t) => normalizeTournament(t));
 
             const latestTournament =
                 latestArray.find((t) => Number(t.id) === tournamentId) ||
@@ -1206,7 +1219,7 @@ async function actionJoinTournament(req, data) {
                 TABLES.config,
                 platform.$id,
                 {
-                    tournaments: mergedArray,
+                    tournaments: writeTournamentArray(mergedArray),
                     updatedAt: nowIso(),
                     updatedBy: uid
                 },
@@ -1222,7 +1235,7 @@ async function actionJoinTournament(req, data) {
                     qrImgUrl: DEFAULT_QR_URL,
                     updatedAt: nowIso(),
                     updatedBy: uid,
-                    tournaments: [newTournament]
+                    tournaments: writeTournamentArray([newTournament])
                 },
                 transactionId
             );
@@ -1349,7 +1362,7 @@ async function actionAdminAddMoney(req, data) {
                 type: "AdminCredit",
                 status: "Approved",
                 amount,
-                details: `Admin direct credit by ${adminUid}`,
+                details: `Admin direct credit by ${adminUid}`
             },
             transactionId
         );
@@ -1408,7 +1421,7 @@ async function actionSubmitDeposit(req, data) {
             status: "Pending",
             utr,
             amount,
-            details: `UTR: ${utr}`,
+            details: `UTR: ${utr}`
         });
     } catch (err) {
         if (err?.status === 409) {
@@ -1489,7 +1502,7 @@ async function actionRequestWithdrawal(req, data) {
                 type: "Withdraw",
                 status: "Pending",
                 amount,
-                details,
+                details
             },
             transactionId
         );
@@ -1511,14 +1524,14 @@ async function actionRequestWithdrawal(req, data) {
 function transactionForAdmin(row) {
     return {
         id: row.$id,
-        userId: row.user_id ?? "",
+        userId: row.userId ?? row.user_id ?? "",
         username: row.username ?? "Gamer",
         type: row.type ?? "",
         status: row.status ?? "",
         utr: row.utr ?? "",
         amount: money(row.amount) || 0,
         details: row.details ?? "",
-        timestamp: row.$createdAt ?? ""
+        timestamp: row.timestamp ?? row.$createdAt ?? ""
     };
 }
 
@@ -1578,7 +1591,7 @@ async function actionApproveTransaction(req, data) {
         }
 
         const type = String(tx.type || "");
-        const userId = String(tx.user_id ?? "");
+        const userId = String(tx.userId ?? tx.user_id ?? "");
         const amount = assertMoney(tx.amount, "transaction amount");
 
         if (!userId) {
