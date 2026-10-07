@@ -1,13 +1,8 @@
 {
-  "name": "indian-club-game-backend",
+  "name": "indian-club-appwrite-function",
   "version": "1.0.0",
-  "description": "Indian Club Game Appwrite backend",
+  "private": true,
+  "type": "module",
   "main": "index.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": "18.x"
-  }
+  "engines": { "node": "18.x" }
 }

@@ -1,1328 +1,1810 @@
-const PROJECT_ID = process.env.APPWRITE_FUNCTION_PROJECT_ID || '6ab2b71c00171587d4fc';
-const DATABASE_ID = process.env.APPWRITE_DATABASE_ID || '6ab2bdb4000c76cc3bef';
-const ENDPOINT = process.env.APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1';
+import { createHash, randomBytes } from "node:crypto";
+
+/*
+ * Indian Club Game - Appwrite Function backend
+ * Function ID: 6ab37be2001d71ca80d3
+ * Scope: Free Fire tournaments + wallet/admin only.
+ * WinGo / Colour Trading / Tiger-Lion / 0-100 game logic is intentionally NOT included.
+ */
+
+const PROJECT_ID =
+    process.env.APPWRITE_FUNCTION_PROJECT_ID ||
+    process.env.APPWRITE_PROJECT_ID ||
+    "6ab2b71c00171587d4fc";
+
+const DATABASE_ID =
+    process.env.APPWRITE_DATABASE_ID ||
+    "6ab2bdb4000c76cc3bef";
+
+const ENDPOINT = (
+    process.env.APPWRITE_ENDPOINT ||
+    process.env.APPWRITE_FUNCTION_API_ENDPOINT ||
+    "https://cloud.appwrite.io/v1"
+).replace(/\/+$/, "");
+
+const API_KEY =
+    process.env.APPWRITE_API_KEY ||
+    process.env.APPWRITE_FUNCTION_API_KEY ||
+    "";
 
 const TABLES = {
-  users: process.env.USERS_TABLE_ID || '6ab2bf1d0025b9c53f38',
-  admins: process.env.ADMINS_TABLE_ID || '6ab34851002ce1959b05',
-  config: process.env.CONFIG_TABLE_ID || '6ab348cb001698034464',
-  game_rounds: process.env.GAME_ROUNDS_TABLE_ID || '6ab349bd001c6378143a',
-  transactions: process.env.TRANSACTIONS_TABLE_ID || 'transactions',
-  bets: process.env.BETS_TABLE_ID || '6ab34ddf001d569d3f06'
+    users: "6ab2bf1d0025b9c53f38",
+    admins: "6ab34851002ce1959b05",
+    config: "6ab348cb001698034464",
+    tournaments: "6abfe6d700319be4c776",
+    transactions: "transactions"
 };
 
-const FEE = 0.02;
+const PLATFORM_CONFIG_KEY = "platform";
+const DEFAULT_UPI_ID = "9833381519@ptyes";
+const DEFAULT_QR_URL =
+    "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=upi://pay?pa=9833381519@ptyes";
 
-const GAME_RULES = {
-  wingo: { seconds: 30 },
-  tiger: { seconds: 30 },
-  number100: { seconds: 300 }
-};
-
-function nowMs() {
-  return Date.now();
-}
-
-function money(n) {
-  return Math.round(Number(n || 0) * 100) / 100;
-}
-
-function enc(s) {
-  return encodeURIComponent(String(s));
-}
-
-function uidFrom(ctx) {
-  const h = ctx?.req?.headers || {};
-
-  return (
-    h['x-appwrite-user-id'] ||
-    h['X-Appwrite-User-Id'] ||
-    process.env.APPWRITE_FUNCTION_USER_ID ||
-    ''
-  );
-}
-
-function keyFrom(ctx) {
-  const h = ctx?.req?.headers || {};
-
-  return (
-    h['x-appwrite-key'] ||
-    h['X-Appwrite-Key'] ||
-    process.env.APPWRITE_FUNCTION_API_KEY ||
-    ''
-  );
-}
-
-function randomId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
-}
-
-/* =========================================================
-   APPWRITE REST API
-========================================================= */
-
-async function api(ctx, method, path, body) {
-  const key = keyFrom(ctx);
-
-  if (!key) {
-    throw new Error(
-      'Appwrite API key missing. Add APPWRITE_FUNCTION_API_KEY to the Function.'
-    );
-  }
-
-  const headers = {
-    'X-Appwrite-Project': PROJECT_ID,
-    'X-Appwrite-Key': key,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-
-  const res = await fetch(`${ENDPOINT}${path}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
-
-  const text = await res.text();
-
-  let data = {};
-
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch (_) {
-    data = { message: text };
-  }
-
-  if (!res.ok) {
-    const e = new Error(
-      data.message ||
-      data.error ||
-      `Appwrite API ${res.status}`
-    );
-
-    e.status = res.status;
-    e.response = data;
-
-    throw e;
-  }
-
-  return data;
-}
-
-async function getRow(ctx, table, rowId) {
-  return api(
-    ctx,
-    'GET',
-    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows/${enc(rowId)}`
-  );
-}
-
-async function updateRow(ctx, table, rowId, data) {
-  return api(
-    ctx,
-    'PATCH',
-    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows/${enc(rowId)}/`,
-    { data }
-  );
-}
-
-async function createRow(ctx, table, data, rowId) {
-  return api(
-    ctx,
-    'POST',
-    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows`,
-    {
-      rowId: rowId || 'unique()',
-      data
+class BackendError extends Error {
+    constructor(message, status = 400, code = "BACKEND_ERROR", details = null) {
+        super(message);
+        this.name = "BackendError";
+        this.status = status;
+        this.code = code;
+        this.details = details;
     }
-  );
 }
 
-async function upsertRow(ctx, table, rowId, data) {
-  try {
-    return await updateRow(ctx, table, rowId, data);
-  } catch (e) {
-    if (e.status !== 404) throw e;
-    return createRow(ctx, table, data, rowId);
-  }
+function nowIso() {
+    return new Date().toISOString();
 }
 
-async function listRows(ctx, table, limit = 100, offset = 0) {
-  const r = await api(
-    ctx,
-    'GET',
-    `/tablesdb/${enc(DATABASE_ID)}/tables/${enc(table)}/rows?limit=${limit}&offset=${offset}`
-  );
-
-  return {
-    ...r,
-    rows: Array.isArray(r.rows) ? r.rows : []
-  };
+function cleanString(value, max = 500) {
+    return String(value ?? "").trim().slice(0, max);
 }
 
-async function listAllRows(ctx, table, pageSize = 100, maxPages = 100) {
-  const out = [];
+function normalizePhone(value) {
+    return String(value ?? "")
+        .trim()
+        .replace(/[\s()+-]/g, "");
+}
 
-  for (let p = 0; p < maxPages; p++) {
-    const r = await listRows(
-      ctx,
-      table,
-      pageSize,
-      p * pageSize
-    );
+function normalizeUtr(value) {
+    return String(value ?? "").trim().toUpperCase();
+}
 
-    out.push(...r.rows);
+function money(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return NaN;
+    return Math.round((n + Number.EPSILON) * 100) / 100;
+}
 
-    if (r.rows.length < pageSize) {
-      break;
+function assertMoney(value, field = "amount", max = 10000000) {
+    const n = money(value);
+    if (!Number.isFinite(n) || n <= 0 || n > max) {
+        throw new BackendError(`Invalid ${field}.`, 400, "INVALID_AMOUNT");
     }
-  }
-
-  return out;
+    return n;
 }
 
-async function safeGetRow(ctx, table, rowId) {
-  try {
-    return await getRow(ctx, table, rowId);
-  } catch (e) {
-    if (e.status === 404) return null;
-    throw e;
-  }
+function makeId(prefix = "row") {
+    return `${prefix}_${randomBytes(12).toString("hex")}`.slice(0, 36);
 }
 
-async function safeUpdateRow(ctx, table, rowId, data) {
-  try {
-    return await updateRow(ctx, table, rowId, data);
-  } catch (e) {
-    if (e.status === 404) {
-      return createRow(ctx, table, data, rowId);
+function hashId(value, prefix = "id") {
+    const digest = createHash("sha256").update(String(value)).digest("hex");
+    return `${prefix}_${digest}`.slice(0, 36);
+}
+
+function getHeader(req, name) {
+    const headers = req?.headers || {};
+    const wanted = String(name).toLowerCase();
+
+    for (const [key, value] of Object.entries(headers)) {
+        if (String(key).toLowerCase() === wanted) {
+            return Array.isArray(value) ? value[0] : value;
+        }
     }
-
-    throw e;
-  }
+    return "";
 }
 
-/* =========================================================
-   SERVER-SIDE DETERMINISTIC RESULT
-========================================================= */
-
-function hashString(s) {
-  let h = 2166136261;
-
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-
-  return h >>> 0;
-}
-
-function mulberry32(a) {
-  return function () {
-    a |= 0;
-    a = (a + 0x6D2B79F5) | 0;
-
-    let t = a;
-
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function seededInt(seed, max) {
-  return Math.floor(
-    mulberry32(hashString(String(seed)))() * max
-  );
-}
-
-function seededChoice(seed, arr) {
-  return arr[seededInt(seed, arr.length)];
-}
-
-/* =========================================================
-   ROUND / PERIOD
-========================================================= */
-
-function periodInfo(gameId, t = nowMs()) {
-  const seconds = GAME_RULES[gameId]?.seconds || 30;
-
-  const size = seconds * 1000;
-
-  const start = Math.floor(t / size) * size;
-
-  const end = start + size;
-
-  const d = new Date(start);
-
-  const period =
-    `${d.getUTCFullYear()}` +
-    `${String(d.getUTCMonth() + 1).padStart(2, '0')}` +
-    `${String(d.getUTCDate()).padStart(2, '0')}` +
-    `${String(d.getUTCHours()).padStart(2, '0')}` +
-    `${String(d.getUTCMinutes()).padStart(2, '0')}` +
-    `${String(d.getUTCSeconds()).padStart(2, '0')}`;
-
-  return {
-    game_id: gameId,
-    period,
-    startAtMs: start,
-    endAtMs: end
-  };
-}
-
-/* =========================================================
-   WIN GO RESULT
-========================================================= */
-
-function colorForNumber(n) {
-  if (n === 0 || n === 5) {
-    return 'violet';
-  }
-
-  return n % 2 === 0 ? 'red' : 'green';
-}
-
-function sizeForNumber(n) {
-  return n >= 5 ? 'Big' : 'Small';
-}
-
-function generateOutcome(gameId, period) {
-  if (gameId === 'wingo') {
-    const number = seededInt(period, 10);
-
-    return {
-      number,
-      color: colorForNumber(number),
-      size: sizeForNumber(number)
-    };
-  }
-
-  if (gameId === 'tiger') {
-    return {
-      winner: seededChoice(
-        period,
-        ['Tiger', 'Lion', 'Tie']
-      )
-    };
-  }
-
-  if (gameId === 'number100') {
-    return {
-      number: seededInt(period, 101)
-    };
-  }
-
-  throw new Error('Unsupported game');
-}
-
-/* =========================================================
-   PAYOUT
-========================================================= */
-
-function payoutMultiplier(gameId, selection, category) {
-  if (gameId === 'wingo') {
-
-    if (category === 'Color') {
-      return String(selection).toLowerCase() === 'violet'
-        ? 4.5
-        : 2;
-    }
-
-    if (category === 'Size') {
-      return 2;
-    }
-
-    if (category === 'Number') {
-      return 9;
-    }
-  }
-
-  if (gameId === 'tiger') {
-    return String(selection).toLowerCase() === 'tie'
-      ? 8
-      : 2;
-  }
-
-  if (gameId === 'number100') {
-    return 30;
-  }
-
-  return 0;
-}
-
-function isWinningBet(gameId, bet, outcome) {
-
-  if (gameId === 'wingo') {
-
-    if (bet.category === 'Color') {
-      return (
-        String(bet.selection).toLowerCase() ===
-        String(outcome.color).toLowerCase()
-      );
-    }
-
-    if (bet.category === 'Size') {
-      return (
-        String(bet.selection).toLowerCase() ===
-        String(outcome.size).toLowerCase()
-      );
-    }
-
-    if (bet.category === 'Number') {
-      return (
-        Number(bet.selection) ===
-        Number(outcome.number)
-      );
-    }
-  }
-
-  if (gameId === 'tiger') {
+function getUserId(req) {
     return (
-      String(bet.selection).toLowerCase() ===
-      String(outcome.winner).toLowerCase()
-    );
-  }
-
-  if (gameId === 'number100') {
-    return (
-      Number(bet.selection) ===
-      Number(outcome.number)
-    );
-  }
-
-  return false;
-}
-
-function parseResult(v) {
-  if (!v) return null;
-
-  if (typeof v === 'object') {
-    return v;
-  }
-
-  try {
-    const x = JSON.parse(String(v));
-
-    return x && typeof x === 'object'
-      ? x
-      : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-/* =========================================================
-   USER / ADMIN
-========================================================= */
-
-async function requireUser(ctx) {
-  const uid = uidFrom(ctx);
-
-  if (!uid) {
-    throw new Error('Login required.');
-  }
-
-  return uid;
-}
-
-async function getUser(ctx, uid) {
-  const row = await safeGetRow(
-    ctx,
-    TABLES.users,
-    uid
-  );
-
-  if (!row) {
-    throw new Error('User profile not found.');
-  }
-
-  return row;
-}
-
-function profileResponse(row) {
-  return {
-    id: row.$id,
-    uid: row.uid || row.$id,
-
-    username:
-      row.username ||
-      row.name ||
-      'Gamer',
-
-    name:
-      row.name ||
-      row.username ||
-      'Gamer',
-
-    phone: row.phone || '',
-
-    balance: Number(row.balance || 0),
-
-    depositBalance:
-      Number(row.depositBalance || 0),
-
-    winningBalance:
-      Number(row.winningBalance || 0),
-
-    createdAt:
-      row.createdAt ||
-      row.$createdAt
-  };
-}
-
-async function requireAdmin(ctx) {
-  const uid = await requireUser(ctx);
-
-  const direct = await safeGetRow(
-    ctx,
-    TABLES.admins,
-    uid
-  );
-
-  if (
-    direct &&
-    String(direct.role || 'admin')
-      .trim()
-      .toLowerCase() === 'admin' &&
-    String(
-      direct.userId ??
-      direct.user_id ??
-      direct.uid ??
-      direct.$id ??
-      ''
-    ).trim() === uid
-  ) {
-    return uid;
-  }
-
-  const rows = await listAllRows(
-    ctx,
-    TABLES.admins
-  );
-
-  const ok = rows.some(r =>
-    String(
-      r.userId ??
-      r.user_id ??
-      r.uid ??
-      r.$id ??
-      ''
-    ).trim() === uid &&
-    String(r.role || 'admin')
-      .trim()
-      .toLowerCase() === 'admin'
-  );
-
-  if (!ok) {
-    throw new Error('Admin verification failed.');
-  }
-
-  return uid;
-}
-
-/* =========================================================
-   PROFILE
-========================================================= */
-
-async function actionCreateProfile(ctx, data) {
-  const uid = await requireUser(ctx);
-
-  const existing = await safeGetRow(
-    ctx,
-    TABLES.users,
-    uid
-  );
-
-  if (existing) {
-    return profileResponse(existing);
-  }
-
-  const username =
-    String(data.username || 'Gamer')
-      .trim()
-      .slice(0, 80);
-
-  const phone =
-    String(data.phone || '')
-      .trim()
-      .slice(0, 40);
-
-  const row = await createRow(
-    ctx,
-    TABLES.users,
-    {
-      uid,
-      username,
-      name: username,
-      phone,
-
-      balance: 0,
-      depositBalance: 0,
-      winningBalance: 0,
-
-      createdAt: new Date().toISOString()
-    },
-    uid
-  );
-
-  return profileResponse(row);
-}
-
-async function actionGetProfile(ctx) {
-  return profileResponse(
-    await getUser(
-      ctx,
-      await requireUser(ctx)
-    )
-  );
-}
-
-/* =========================================================
-   PLATFORM CONFIG
-========================================================= */
-
-async function findPlatformConfigRow(ctx) {
-
-  const direct = await safeGetRow(
-    ctx,
-    TABLES.config,
-    'platform'
-  );
-
-  if (direct) {
-    return direct;
-  }
-
-  const rows = await listAllRows(
-    ctx,
-    TABLES.config
-  );
-
-  return (
-    rows.find(
-      r =>
-        String(r.key || '')
-          .trim()
-          .toLowerCase() === 'platform'
-    ) || null
-  );
-}
-
-async function actionGetPlatformConfig(ctx) {
-
-  const row =
-    await findPlatformConfigRow(ctx);
-
-  if (!row) {
-    return {
-      upiId: '',
-      qrImgUrl: '',
-      tournaments: []
-    };
-  }
-
-  let tournaments = [];
-
-  if (Array.isArray(row.tournaments)) {
-    tournaments = row.tournaments;
-  } else if (row.tournaments) {
-
-    try {
-      tournaments =
-        JSON.parse(row.tournaments);
-
-      if (!Array.isArray(tournaments)) {
-        tournaments = [];
-      }
-
-    } catch (_) {
-      tournaments = [];
-    }
-  }
-
-  return {
-    upiId: String(row.upiId || ''),
-    qrImgUrl: String(row.qrImgUrl || ''),
-    tournaments
-  };
-}
-
-async function actionSetPlatformConfig(ctx, data) {
-
-  const uid = await requireAdmin(ctx);
-
-  const row =
-    await findPlatformConfigRow(ctx);
-
-  const payload = {};
-
-  if (data.upiId !== undefined) {
-    payload.upiId =
-      String(data.upiId || '').trim();
-  }
-
-  if (data.qrImgUrl !== undefined) {
-    payload.qrImgUrl =
-      String(data.qrImgUrl || '').trim();
-  }
-
-  payload.updatedAt =
-    new Date().toISOString();
-
-  payload.updatedBy = uid;
-
-  const saved = row
-    ? await updateRow(
-        ctx,
-        TABLES.config,
-        row.$id,
-        payload
-      )
-    : await createRow(
-        ctx,
-        TABLES.config,
-        {
-          key: 'platform',
-          ...payload
-        },
-        'platform'
-      );
-
-  return {
-    ok: true,
-
-    config: {
-      upiId:
-        String(saved.upiId || ''),
-
-      qrImgUrl:
-        String(saved.qrImgUrl || '')
-    }
-  };
-}
-
-/* =========================================================
-   ADMIN DIRECT RESULT OVERRIDE ENDPOINT (Appwrite Synced)
-========================================================= */
-
-async function actionSetGameResultOverride(ctx, data) {
-  await requireAdmin(ctx);
-
-  const gameId = String(data.game_id || data.gameId || 'wingo').trim();
-  if (!GAME_RULES[gameId]) throw new Error('Unsupported gameId.');
-
-  const current = periodInfo(gameId);
-  const roundId = `${gameId}_${current.period}`;
-
-  let outcome = {};
-
-  if (gameId === 'wingo') {
-    const num = Number(data.number ?? 0);
-    outcome = {
-      number: num,
-      color: colorForNumber(num),
-      size: sizeForNumber(num)
-    };
-  } else if (gameId === 'tiger') {
-    outcome = {
-      winner: String(data.winner || 'Tiger').trim()
-    };
-  } else if (gameId === 'number100') {
-    outcome = {
-      number: Number(data.number ?? 0)
-    };
-  }
-
-  const payload = {
-    game_id: gameId,
-    period: current.period,
-    status: 'open',
-    start_at_ms: current.startAtMs,
-    end_at_ms: current.endAtMs,
-    result_json: JSON.stringify(outcome),
-    result: String(outcome.number ?? outcome.winner ?? ''),
-    color: outcome.color || '',
-    size: outcome.size || ''
-  };
-
-  const updated = await upsertRow(ctx, TABLES.game_rounds, roundId, payload);
-
-  return {
-    ok: true,
-    roundId,
-    outcome,
-    updated
-  };
-}
-
-/* =========================================================
-   TOURNAMENTS
-========================================================= */
-
-async function actionGetTournaments(ctx) {
-  const config =
-    await actionGetPlatformConfig(ctx);
-
-  return config.tournaments || [];
-}
-
-async function actionSetTournaments(ctx, data) {
-
-  await requireAdmin(ctx);
-
-  const row =
-    await findPlatformConfigRow(ctx);
-
-  const tournaments =
-    Array.isArray(data.tournaments)
-      ? data.tournaments
-      : [];
-
-  const payload = {
-    tournaments,
-
-    updatedAt:
-      new Date().toISOString(),
-
-    updatedBy:
-      uidFrom(ctx)
-  };
-
-  const saved = row
-    ? await updateRow(
-        ctx,
-        TABLES.config,
-        row.$id,
-        payload
-      )
-    : await createRow(
-        ctx,
-        TABLES.config,
-        {
-          key: 'platform',
-          upiId: '',
-          qrImgUrl: '',
-          ...payload
-        },
-        'platform'
-      );
-
-  return {
-    ok: true,
-
-    tournaments:
-      Array.isArray(saved.tournaments)
-        ? saved.tournaments
-        : tournaments
-  };
-}
-
-/* =========================================================
-   ENSURE GAME ROUND
-========================================================= */
-
-async function actionEnsureGameRound(ctx, data) {
-
-  const gameId =
-    String(
-      data.game_id ||
-      data.gameId ||
-      ''
+        getHeader(req, "x-appwrite-user-id") ||
+        getHeader(req, "x-appwrite-user-id".replace(/-/g, "_")) ||
+        ""
     ).trim();
+}
 
-  if (!GAME_RULES[gameId]) {
-    throw new Error(
-      'Unsupported gameId.'
-    );
-  }
+function parseBody(req) {
+    if (req?.bodyJson && typeof req.bodyJson === "object") {
+        return req.bodyJson;
+    }
 
-  const current =
-    periodInfo(gameId);
+    if (typeof req?.body === "object" && req.body !== null) {
+        return req.body;
+    }
 
-  const roundId =
-    `${gameId}_${current.period}`;
+    const raw =
+        typeof req?.bodyRaw === "string"
+            ? req.bodyRaw
+            : typeof req?.body === "string"
+                ? req.body
+                : "";
 
-  let round =
-    await safeGetRow(
-      ctx,
-      TABLES.game_rounds,
-      roundId
-    );
-
-  if (!round) {
-
-    const outcome =
-      generateOutcome(
-        gameId,
-        current.period
-      );
-
-    round =
-      await createRow(
-        ctx,
-        TABLES.game_rounds,
-        {
-          game_id: gameId,
-          period: current.period,
-
-          status: 'open',
-
-          start_at_ms:
-            current.startAtMs,
-
-          end_at_ms:
-            current.endAtMs,
-
-          result_json:
-            JSON.stringify(outcome),
-
-          result:
-            String(
-              outcome.number ??
-              outcome.winner ??
-              ''
-            ),
-
-          color:
-            outcome.color || '',
-
-          size:
-            outcome.size || ''
-        },
-        roundId
-      );
-  }
-
-  const prev =
-    periodInfo(
-      gameId,
-      current.startAtMs - 1
-    );
-
-  const prevId =
-    `${gameId}_${prev.period}`;
-
-  const prevRow =
-    await safeGetRow(
-      ctx,
-      TABLES.game_rounds,
-      prevId
-    );
-
-  if (
-    prevRow &&
-    prevRow.status !== 'settled' &&
-    Number(prevRow.end_at_ms) <= nowMs()
-  ) {
+    if (!raw) return {};
 
     try {
+        return JSON.parse(raw);
+    } catch {
+        throw new BackendError("Request body must be valid JSON.", 400, "INVALID_JSON");
+    }
+}
 
-      await settleRoundInternal(
-        ctx,
-        gameId,
-        prev.period
-      );
-
-    } catch (e) {
-
-      try {
-        ctx.error?.(
-          `Auto settlement ${gameId}/${prev.period}: ${e.message}`
+async function appwriteRequest(path, options = {}) {
+    if (!API_KEY) {
+        throw new BackendError(
+            "APPWRITE_API_KEY is not configured in the Function.",
+            500,
+            "MISSING_API_KEY"
         );
-      } catch (_) {}
     }
-  }
 
-  return {
-    ...periodInfo(gameId),
+    const url = `${ENDPOINT}${path.startsWith("/") ? path : `/${path}`}`;
+    const headers = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-Appwrite-Project": PROJECT_ID,
+        "X-Appwrite-Key": API_KEY,
+        "X-Appwrite-Response-Format": "2.3.0",
+        ...(options.headers || {})
+    };
 
-    roundId,
+    let response;
+    try {
+        response = await fetch(url, {
+            method: options.method || "GET",
+            headers,
+            body: options.body === undefined ? undefined : JSON.stringify(options.body)
+        });
+    } catch (err) {
+        throw new BackendError(
+            `Appwrite network error: ${err?.message || "request failed"}`,
+            502,
+            "APPWRITE_NETWORK_ERROR"
+        );
+    }
 
-    serverNowMs:
-      nowMs(),
+    const raw = await response.text();
+    let payload = {};
+    if (raw) {
+        try {
+            payload = JSON.parse(raw);
+        } catch {
+            payload = { message: raw };
+        }
+    }
 
-    status:
-      round.status,
+    if (!response.ok) {
+        const message =
+            payload?.message ||
+            payload?.error ||
+            payload?.description ||
+            `Appwrite HTTP ${response.status}`;
 
-    result:
-      parseResult(
-        round.result_json
-      )
-  };
+        throw new BackendError(
+            String(message),
+            response.status,
+            payload?.type || "APPWRITE_ERROR",
+            payload
+        );
+    }
+
+    return payload;
 }
 
-/* =========================================================
-   PLACE BET
-========================================================= */
-
-async function actionPlaceGameBet(ctx, data) {
-
-  const uid =
-    await requireUser(ctx);
-
-  const gameId =
-    String(
-      data.game_id ||
-      data.gameId ||
-      ''
-    ).trim();
-
-  const category =
-    String(
-      data.category || ''
-    ).trim();
-
-  const selection =
-    String(
-      data.selection ?? ''
-    ).trim();
-
-  const amount =
-    money(data.amount);
-
-  if (
-    !GAME_RULES[gameId] ||
-    !selection ||
-    !Number.isFinite(amount) ||
-    amount <= 0
-  ) {
-    throw new Error('Invalid bet.');
-  }
-
-  const round =
-    periodInfo(gameId);
-
-  if (
-    nowMs() >
-    round.endAtMs - 5000
-  ) {
-    throw new Error(
-      'Betting is closed for this round.'
-    );
-  }
-
-  const multiplier =
-    payoutMultiplier(
-      gameId,
-      selection,
-      category
-    );
-
-  if (multiplier <= 0) {
-    throw new Error(
-      'Invalid selection/category.'
-    );
-  }
-
-  const user =
-    await getUser(ctx, uid);
-
-  if (
-    money(user.balance) <
-    amount
-  ) {
-    throw new Error(
-      'Insufficient balance.'
-    );
-  }
-
-  await updateRow(
-    ctx,
-    TABLES.users,
-    uid,
-    {
-      balance:
-        money(
-          Number(user.balance) -
-          amount
-        )
-    }
-  );
-
-  const betId =
-    `bet_${randomId()}`;
-
-  return createRow(
-    ctx,
-    TABLES.bets,
-    {
-      userId: uid,
-
-      gameId,
-
-      period:
-        round.period,
-
-      selection,
-
-      category,
-
-      amount,
-
-      status: 'open',
-
-      payout: 0,
-
-      multiplier,
-
-      createdAt:
-        new Date().toISOString()
-    },
-    betId
-  );
+function queryString(method, column, values = []) {
+    const q = {
+        method,
+        ...(column ? { column } : {}),
+        ...(values.length ? { values } : {})
+    };
+    return JSON.stringify(q);
 }
 
-/* =========================================================
-   SETTLE ROUND (Completed Routine)
-========================================================= */
+function buildListPath(tableId, queries = []) {
+    const params = new URLSearchParams();
+    queries.forEach((q) => params.append("queries[]", q));
+    return `/tablesdb/${encodeURIComponent(DATABASE_ID)}/tables/${encodeURIComponent(tableId)}/rows${
+        params.toString() ? `?${params.toString()}` : ""
+    }`;
+}
 
-async function settleRoundInternal(
-  ctx,
-  gameId,
-  period
-) {
+async function listRows(tableId, queries = []) {
+    return appwriteRequest(buildListPath(tableId, queries));
+}
 
-  const roundId =
-    `${gameId}_${period}`;
+async function listAllRows(tableId, baseQueries = [], maxRows = 5000) {
+    const rows = [];
+    let cursor = "";
+    let guard = 0;
 
-  const round =
-    await safeGetRow(
-      ctx,
-      TABLES.game_rounds,
-      roundId
+    while (rows.length < maxRows && guard < 100) {
+        guard += 1;
+
+        const queries = [...baseQueries, queryString("limit", "", [100])];
+        if (cursor) {
+            queries.push(queryString("cursorAfter", "", [cursor]));
+        }
+
+        const result = await listRows(tableId, queries);
+        const batch = Array.isArray(result?.rows) ? result.rows : [];
+        rows.push(...batch);
+
+        if (batch.length < 100) break;
+        cursor = batch[batch.length - 1]?.$id;
+        if (!cursor) break;
+    }
+
+    return rows.slice(0, maxRows);
+}
+
+async function getRow(tableId, rowId) {
+    return appwriteRequest(
+        `/tablesdb/${encodeURIComponent(DATABASE_ID)}/tables/${encodeURIComponent(tableId)}/rows/${encodeURIComponent(rowId)}`
+    );
+}
+
+async function createRow(tableId, rowId, data, transactionId = null) {
+    return appwriteRequest(
+        `/tablesdb/${encodeURIComponent(DATABASE_ID)}/tables/${encodeURIComponent(tableId)}/rows`,
+        {
+            method: "POST",
+            body: {
+                rowId: rowId || "unique()",
+                data,
+                ...(transactionId ? { transactionId } : {})
+            }
+        }
+    );
+}
+
+async function updateRow(tableId, rowId, data, transactionId = null) {
+    return appwriteRequest(
+        `/tablesdb/${encodeURIComponent(DATABASE_ID)}/tables/${encodeURIComponent(tableId)}/rows/${encodeURIComponent(rowId)}`,
+        {
+            method: "PATCH",
+            body: {
+                data,
+                ...(transactionId ? { transactionId } : {})
+            }
+        }
+    );
+}
+
+async function upsertRow(tableId, rowId, data, transactionId = null) {
+    return appwriteRequest(
+        `/tablesdb/${encodeURIComponent(DATABASE_ID)}/tables/${encodeURIComponent(tableId)}/rows/${encodeURIComponent(rowId)}`,
+        {
+            method: "PUT",
+            body: {
+                rowId,
+                data,
+                ...(transactionId ? { transactionId } : {})
+            }
+        }
+    );
+}
+
+async function createDbTransaction(ttl = 60) {
+    return appwriteRequest("/tablesdb/transactions", {
+        method: "POST",
+        body: { ttl }
+    });
+}
+
+async function commitDbTransaction(transactionId) {
+    return appwriteRequest(
+        `/tablesdb/transactions/${encodeURIComponent(transactionId)}`,
+        {
+            method: "PATCH",
+            body: { commit: true, rollback: false }
+        }
+    );
+}
+
+async function rollbackDbTransaction(transactionId) {
+    try {
+        await appwriteRequest(
+            `/tablesdb/transactions/${encodeURIComponent(transactionId)}`,
+            {
+                method: "PATCH",
+                body: { commit: false, rollback: true }
+            }
+        );
+    } catch {
+        // The original Appwrite error is more useful to the caller.
+    }
+}
+
+async function withDbTransaction(work, ttl = 60) {
+    const tx = await createDbTransaction(ttl);
+    const transactionId = tx?.$id;
+
+    if (!transactionId) {
+        throw new BackendError(
+            "Appwrite did not return a database transaction ID.",
+            502,
+            "TRANSACTION_CREATE_FAILED"
+        );
+    }
+
+    try {
+        const result = await work(transactionId);
+        await commitDbTransaction(transactionId);
+        return result;
+    } catch (err) {
+        await rollbackDbTransaction(transactionId);
+        throw err;
+    }
+}
+
+async function findOne(tableId, queries) {
+    const result = await listRows(tableId, [
+        ...queries,
+        queryString("limit", "", [1])
+    ]);
+    return Array.isArray(result?.rows) && result.rows.length
+        ? result.rows[0]
+        : null;
+}
+
+async function findUserByUid(uid) {
+    return findOne(TABLES.users, [
+        queryString("equal", "uid", [uid])
+    ]);
+}
+
+async function findAdminByUid(uid) {
+    const direct = await findOne(TABLES.admins, [
+        queryString("equal", "uid", [uid])
+    ]);
+    if (direct) return direct;
+
+    const byUserId = await findOne(TABLES.admins, [
+        queryString("equal", "user_id", [uid])
+    ]);
+    if (byUserId) return byUserId;
+
+    return findOne(TABLES.admins, [
+        queryString("equal", "user_id", [uid])
+    ]);
+}
+
+async function requireAuth(req) {
+    const uid = getUserId(req);
+    if (!uid) {
+        throw new BackendError(
+            "Login required. Appwrite user identity was not provided.",
+            401,
+            "AUTH_REQUIRED"
+        );
+    }
+
+    return uid;
+}
+
+async function requireAdmin(req) {
+    const uid = await requireAuth(req);
+    const admin = await findAdminByUid(uid);
+
+    if (!admin) {
+        throw new BackendError(
+            "Access denied: authenticated user is not authorized as admin.",
+            403,
+            "ADMIN_REQUIRED"
+        );
+    }
+
+    const role = String(admin.role ?? "admin").toLowerCase();
+    if (role && !["admin", "superadmin", "owner", "host"].includes(role)) {
+        throw new BackendError(
+            "Access denied: admin role is not authorized.",
+            403,
+            "ADMIN_REQUIRED"
+        );
+    }
+
+    return { uid, admin };
+}
+
+function normalizeProfile(row) {
+    if (!row) return null;
+
+    const balance = money(row.balance) || 0;
+    const depositBalance = money(row.depositBalance) || 0;
+    const winningBalance = money(row.winningBalance) || 0;
+
+    return {
+        id: row.$id,
+        uid: String(row.uid ?? ""),
+        username: String(row.username ?? row.name ?? "Gamer"),
+        name: String(row.name ?? row.username ?? "Gamer"),
+        phone: String(row.phone ?? ""),
+        balance,
+        depositBalance,
+        winningBalance,
+        createdAt: row.createdAt ?? row.$createdAt ?? null
+    };
+}
+
+function normalizeTournament(raw, fallbackId = null) {
+    const idValue = raw?.id ?? fallbackId ?? raw?.$id;
+    const id = Number(idValue);
+
+    return {
+        id: Number.isFinite(id) ? id : fallbackId,
+        title: cleanString(raw?.title, 150) || "Free Fire Tournament",
+        time: cleanString(raw?.time, 100),
+        booyah: cleanString(raw?.booyah, 50),
+        prize: cleanString(raw?.prize, 100) || "₹0",
+        perKill: cleanString(raw?.perKill, 50) || "₹0",
+        entry: money(raw?.entry ?? raw?.entryFee) || 0,
+        currentJoined: Math.max(
+            0,
+            Number(raw?.currentJoined ?? (Array.isArray(raw?.joinedUsers) ? raw.joinedUsers.length : 0)) || 0
+        ),
+        maxSlots: Math.max(0, Number(raw?.maxSlots ?? raw?.slots) || 0),
+        type: cleanString(raw?.type, 30) || "squad",
+        map: cleanString(raw?.map, 50) || "BERMUDA",
+        roomId: cleanString(raw?.roomId ?? raw?.roomid, 100),
+        roomPass: cleanString(raw?.roomPass ?? raw?.password, 100),
+        joinedUsers: Array.isArray(raw?.joinedUsers)
+            ? [...new Set(raw.joinedUsers.map(String))]
+            : [],
+        status: cleanString(raw?.status, 30) || "open"
+    };
+}
+
+function tournamentToTableData(t) {
+    return {
+        title: t.title,
+        prize: t.prize,
+        entryFee: t.entry,
+        slots: t.maxSlots,
+        time: t.time,
+        roomid: t.roomId,
+        password: t.roomPass,
+        status: t.status || "open",
+        updatedAt: nowIso()
+    };
+}
+
+function inferTypeFromTitle(title) {
+    const x = String(title || "").toLowerCase();
+    if (x.includes("solo")) return "solo";
+    if (x.includes("clash")) return "clash";
+    return "squad";
+}
+
+function buildTournamentFromTable(row) {
+    const id = Number(row.$id);
+    return normalizeTournament(
+        {
+            id,
+            title: row.title,
+            time: row.time,
+            prize: row.prize,
+            entryFee: row.entryFee,
+            slots: row.slots,
+            roomid: row.roomid,
+            password: row.password,
+            status: row.status,
+            type: inferTypeFromTitle(row.title),
+            map: "BERMUDA",
+            joinedUsers: []
+        },
+        id
+    );
+}
+
+async function getPlatformConfigRow() {
+    const byKey = await findOne(TABLES.config, [
+        queryString("equal", "key", [PLATFORM_CONFIG_KEY])
+    ]);
+    if (byKey) return byKey;
+
+    // Preserve compatibility with an older config row whose ID was used as "platform".
+    try {
+        const direct = await getRow(TABLES.config, PLATFORM_CONFIG_KEY);
+        if (direct) return direct;
+    } catch (err) {
+        if (err?.status !== 404) throw err;
+    }
+
+    const rows = await listRows(TABLES.config, [
+        queryString("limit", "", [1])
+    ]);
+    return Array.isArray(rows?.rows) && rows.rows.length ? rows.rows[0] : null;
+}
+
+async function getTournamentState() {
+    const config = await getPlatformConfigRow();
+    const configTournaments = Array.isArray(config?.tournaments)
+        ? config.tournaments.map((t) => normalizeTournament(t))
+        : [];
+
+    const tableRows = await listAllRows(TABLES.tournaments, [], 100);
+    const tableTournaments = tableRows
+        .map((row) => buildTournamentFromTable(row))
+        .filter((t) => Number.isInteger(t.id));
+
+    const byId = new Map();
+
+    for (const t of tableTournaments) byId.set(Number(t.id), t);
+    for (const t of configTournaments) {
+        if (Number.isInteger(t.id)) {
+            const old = byId.get(Number(t.id));
+            byId.set(Number(t.id), normalizeTournament({ ...old, ...t }, Number(t.id)));
+        }
+    }
+
+    return {
+        config,
+        tournaments: [...byId.values()].sort((a, b) => Number(a.id) - Number(b.id))
+    };
+}
+
+async function getTournamentById(tournamentId) {
+    const state = await getTournamentState();
+    const tournament = state.tournaments.find(
+        (t) => Number(t.id) === Number(tournamentId)
     );
 
-  if (!round) {
-    return {
-      settled: false,
-      reason: 'round_not_found'
-    };
-  }
+    if (!tournament) {
+        throw new BackendError(
+            "Tournament not found.",
+            404,
+            "TOURNAMENT_NOT_FOUND"
+        );
+    }
 
-  if (round.status === 'settled') {
-    return {
-      settled: true,
-      period,
-      ...(parseResult(
-        round.result_json
-      ) || {}),
-      settledBets: []
-    };
-  }
+    return { ...state, tournament };
+}
 
-  if (
-    Number(round.end_at_ms) >
-    nowMs()
-  ) {
-    return {
-      settled: false,
-      reason: 'round_still_open'
-    };
-  }
-
-  const outcome =
-    parseResult(
-      round.result_json
-    ) ||
-    generateOutcome(
-      gameId,
-      period
-    );
-
-  try {
-
-    await updateRow(
-      ctx,
-      TABLES.game_rounds,
-      roundId,
-      {
-        status: 'settling'
-      }
-    );
-
-  } catch (e) {
-
-    const latest =
-      await safeGetRow(
-        ctx,
-        TABLES.game_rounds,
-        roundId
-      );
+function assertTournamentOpen(tournament) {
+    const status = String(tournament.status || "open").toLowerCase();
 
     if (
-      latest?.status ===
-      'settled'
+        ["closed", "inactive", "disabled", "locked", "completed", "cancelled", "full"].includes(status)
     ) {
-      return {
-        settled: true,
-        period,
-        ...(parseResult(
-          latest.result_json
-        ) || {}),
-        settledBets: []
-      };
+        throw new BackendError(
+            "Tournament joining is currently closed.",
+            409,
+            "TOURNAMENT_CLOSED"
+        );
     }
 
-    throw e;
-  }
-
-  const allBets =
-    await listAllRows(
-      ctx,
-      TABLES.bets
-    );
-
-  const bets =
-    allBets.filter(
-      b =>
-        String(
-          b.gameId ||
-          b.game_id
-        ) === gameId &&
-
-        String(b.period) ===
-        period &&
-
-        String(b.status) ===
-        'open'
-    );
-
-  const settledBets = [];
-
-  for (const bet of bets) {
-
-    const win =
-      isWinningBet(
-        gameId,
-        {
-          ...bet,
-          selection: bet.selection,
-          category: bet.category
-        },
-        outcome
-      );
-
-    let payout = 0;
-
-    if (win) {
-      const gross = money(Number(bet.amount || 0) * Number(bet.multiplier || 1));
-      payout = money(gross * (1 - FEE));
+    if (tournament.maxSlots <= 0) {
+        throw new BackendError(
+            "Tournament slots are not configured.",
+            409,
+            "INVALID_TOURNAMENT_SLOTS"
+        );
     }
 
-    await updateRow(
-      ctx,
-      TABLES.bets,
-      bet.$id,
-      {
-        status: win ? 'won' : 'lost',
-        payout
-      }
-    );
-
-    if (win && payout > 0 && bet.userId) {
-      const user = await safeGetRow(ctx, TABLES.users, bet.userId);
-      if (user) {
-        const curBal = Number(user.balance || 0);
-        const curWin = Number(user.winningBalance || 0);
-
-        await updateRow(ctx, TABLES.users, bet.userId, {
-          balance: money(curBal + payout),
-          winningBalance: money(curWin + payout)
-        });
-      }
+    if (tournament.currentJoined >= tournament.maxSlots) {
+        throw new BackendError(
+            "Tournament is full.",
+            409,
+            "TOURNAMENT_FULL"
+        );
     }
-
-    settledBets.push({
-      betId: bet.$id,
-      userId: bet.userId,
-      win,
-      payout
-    });
-  }
-
-  await updateRow(
-    ctx,
-    TABLES.game_rounds,
-    roundId,
-    {
-      status: 'settled',
-      result_json: JSON.stringify(outcome)
-    }
-  );
-
-  return {
-    settled: true,
-    period,
-    outcome,
-    settledBets
-  };
 }
 
-/* =========================================================
-   MAIN APPWRITE ROUTER HANDLER
-========================================================= */
+function spendWallet(profile, amount) {
+    const total = money(profile.balance) || 0;
+    const deposit = money(profile.depositBalance) || 0;
+    const winning = money(profile.winningBalance) || 0;
 
-module.exports = async function (ctx) {
-  try {
-    let reqData = {};
-
-    if (ctx.req?.body) {
-      try {
-        reqData = typeof ctx.req.body === 'string' ? JSON.parse(ctx.req.body) : ctx.req.body;
-      } catch (_) {
-        reqData = {};
-      }
+    if (total + 0.0001 < amount) {
+        throw new BackendError(
+            "Insufficient wallet balance.",
+            409,
+            "INSUFFICIENT_BALANCE"
+        );
     }
 
-    const action = reqData.action || ctx.req?.query?.action || 'ensureGameRound';
+    // Preserve the wallet split: consume deposit balance first, then winnings.
+    let remaining = amount;
+    const fromDeposit = Math.min(deposit, remaining);
+    remaining = money(remaining - fromDeposit);
+    const fromWinning = remaining;
 
-    let result = null;
-
-    switch (action) {
-      case 'createProfile':
-        result = await actionCreateProfile(ctx, reqData);
-        break;
-      case 'getProfile':
-        result = await actionGetProfile(ctx);
-        break;
-      case 'getPlatformConfig':
-        result = await actionGetPlatformConfig(ctx);
-        break;
-      case 'setPlatformConfig':
-        result = await actionSetPlatformConfig(ctx, reqData);
-        break;
-      case 'getTournaments':
-        result = await actionGetTournaments(ctx);
-        break;
-      case 'setTournaments':
-        result = await actionSetTournaments(ctx, reqData);
-        break;
-      case 'ensureGameRound':
-        result = await actionEnsureGameRound(ctx, reqData);
-        break;
-      case 'placeGameBet':
-        result = await actionPlaceGameBet(ctx, reqData);
-        break;
-      case 'overrideResult':
-      case 'setGameResultOverride':
-        result = await actionSetGameResultOverride(ctx, reqData);
-        break;
-      default:
-        result = await actionEnsureGameRound(ctx, reqData);
-        break;
+    if (winning + 0.0001 < fromWinning) {
+        // If the stored component values are inconsistent with total balance,
+        // do not silently manufacture money.
+        throw new BackendError(
+            "Wallet balances are inconsistent. Please contact support.",
+            409,
+            "WALLET_INCONSISTENT"
+        );
     }
 
-    return ctx.res.json({
-      success: true,
-      data: result
+    return {
+        balance: money(total - amount),
+        depositBalance: money(deposit - fromDeposit),
+        winningBalance: money(winning - fromWinning)
+    };
+}
+
+function refundWinningWallet(profile, amount) {
+    return {
+        balance: money((profile.balance || 0) + amount),
+        depositBalance: money(profile.depositBalance || 0),
+        winningBalance: money((profile.winningBalance || 0) + amount)
+    };
+}
+
+function validateFreeFireUid(value) {
+    const uid = cleanString(value, 30);
+    if (!/^\d{6,15}$/.test(uid)) {
+        throw new BackendError(
+            "Please enter a valid Free Fire UID.",
+            400,
+            "INVALID_FREE_FIRE_UID"
+        );
+    }
+    return uid;
+}
+
+function validateFreeFireName(value) {
+    const name = cleanString(value, 50);
+    if (name.length < 2 || name.length > 50) {
+        throw new BackendError(
+            "Please enter a valid in-game name.",
+            400,
+            "INVALID_FREE_FIRE_NAME"
+        );
+    }
+    return name;
+}
+
+function validateUpi(value) {
+    const upi = cleanString(value, 120);
+    if (!/^[A-Za-z0-9._-]{2,80}@[A-Za-z0-9.-]{2,40}$/.test(upi)) {
+        throw new BackendError(
+            "Invalid UPI ID.",
+            400,
+            "INVALID_UPI"
+        );
+    }
+    return upi;
+}
+
+function canonicalWithdrawalDetails(method, details) {
+    const raw = cleanString(details, 1000);
+
+    if (method === "upi") {
+        const match = raw.match(/^UPI ID:\s*(.+)$/i);
+        const upi = validateUpi(match ? match[1].trim() : raw);
+        return `UPI ID: ${upi}`;
+    }
+
+    if (method !== "bank") {
+        throw new BackendError(
+            "Unsupported withdrawal method.",
+            400,
+            "INVALID_WITHDRAW_METHOD"
+        );
+    }
+
+    const match = raw.match(
+        /^Holder:\s*(.+?),\s*Bank:\s*(.+?),\s*Acc:\s*([A-Za-z0-9-]{6,30}),\s*IFSC:\s*([A-Za-z]{4}0[A-Za-z0-9]{6})$/i
+    );
+
+    if (!match) {
+        throw new BackendError(
+            "Invalid bank withdrawal details.",
+            400,
+            "INVALID_BANK_DETAILS"
+        );
+    }
+
+    const holder = cleanString(match[1], 100);
+    const bank = cleanString(match[2], 120);
+    const account = cleanString(match[3], 30);
+    const ifsc = cleanString(match[4], 11).toUpperCase();
+
+    if (holder.length < 2 || bank.length < 2) {
+        throw new BackendError(
+            "Invalid bank holder or bank name.",
+            400,
+            "INVALID_BANK_DETAILS"
+        );
+    }
+
+    return `Holder: ${holder}, Bank: ${bank}, Acc: ${account}, IFSC: ${ifsc}`;
+}
+
+function publicTournament(t) {
+    const normalized = normalizeTournament(t, Number(t.id));
+
+    return {
+        id: normalized.id,
+        title: normalized.title,
+        time: normalized.time,
+        booyah: normalized.booyah,
+        prize: normalized.prize,
+        perKill: normalized.perKill,
+        entry: normalized.entry,
+        entryFee: normalized.entry,
+        currentJoined: normalized.joinedUsers.length,
+        maxSlots: normalized.maxSlots,
+        slots: normalized.maxSlots,
+        type: normalized.type,
+        map: normalized.map,
+        roomid: normalized.roomId,
+        roomId: normalized.roomId,
+        password: normalized.roomPass,
+        roomPass: normalized.roomPass,
+        joinedUsers: normalized.joinedUsers,
+        status: normalized.status
+    };
+}
+
+async function actionVerifyAdmin(req) {
+    const uid = await requireAuth(req);
+    const admin = await findAdminByUid(uid);
+
+    return {
+        isAdmin: Boolean(admin),
+        uid,
+        role: admin?.role ?? null
+    };
+}
+
+async function actionGetPlatformConfig() {
+    const config = await getPlatformConfigRow();
+
+    return {
+        upiId: config?.upiId ?? DEFAULT_UPI_ID,
+        qrImgUrl: config?.qrImgUrl ?? DEFAULT_QR_URL
+    };
+}
+
+async function actionSetPlatformConfig(req, data) {
+    const { uid } = await requireAdmin(req);
+
+    const upiId = validateUpi(data?.upiId);
+    const qrImgUrl = cleanString(data?.qrImgUrl, 2000);
+
+    if (qrImgUrl && !/^https?:\/\//i.test(qrImgUrl)) {
+        throw new BackendError(
+            "QR image URL must start with http:// or https://.",
+            400,
+            "INVALID_QR_URL"
+        );
+    }
+
+    const current = await getPlatformConfigRow();
+    const patch = {
+        upiId,
+        qrImgUrl,
+        updatedAt: nowIso(),
+        updatedBy: uid
+    };
+
+    if (current) {
+        await updateRow(TABLES.config, current.$id, patch);
+    } else {
+        await createRow(TABLES.config, PLATFORM_CONFIG_KEY, {
+            key: PLATFORM_CONFIG_KEY,
+            upiId,
+            qrImgUrl,
+            updatedAt: nowIso(),
+            updatedBy: uid,
+            tournaments: []
+        });
+    }
+
+    return { upiId, qrImgUrl };
+}
+
+async function actionGetTournaments() {
+    const { tournaments } = await getTournamentState();
+
+    return {
+        tournaments: tournaments.map(publicTournament)
+    };
+}
+
+async function actionSetTournaments(req, data) {
+    const { uid } = await requireAdmin(req);
+
+    if (!Array.isArray(data?.tournaments)) {
+        throw new BackendError(
+            "tournaments must be an array.",
+            400,
+            "INVALID_TOURNAMENT_PAYLOAD"
+        );
+    }
+
+    const incoming = data.tournaments;
+    if (incoming.length > 100) {
+        throw new BackendError(
+            "Too many tournaments in one request.",
+            400,
+            "TOO_MANY_TOURNAMENTS"
+        );
+    }
+
+    const currentState = await getTournamentState();
+    const currentById = new Map(
+        currentState.tournaments.map((t) => [Number(t.id), t])
+    );
+
+    const adminTournaments = [];
+
+    for (let index = 0; index < incoming.length; index += 1) {
+        const raw = incoming[index];
+        const id = Number(raw?.id);
+
+        if (!Number.isInteger(id) || id <= 0) {
+            throw new BackendError(
+                `Invalid tournament ID at position ${index + 1}.`,
+                400,
+                "INVALID_TOURNAMENT_ID"
+            );
+        }
+
+        const existing = currentById.get(id);
+        const title = cleanString(raw?.title, 150);
+        const time = cleanString(raw?.time, 100);
+        const prize = cleanString(raw?.prize, 100);
+        const perKill = cleanString(
+            raw?.perKill ?? existing?.perKill ?? "₹0",
+            50
+        );
+
+        const entry = assertMoney(
+            raw?.entry ?? raw?.entryFee,
+            "entry fee",
+            1000000
+        );
+
+        const maxSlots = Number(raw?.maxSlots ?? raw?.slots);
+        if (!Number.isInteger(maxSlots) || maxSlots < 1 || maxSlots > 10000) {
+            throw new BackendError(
+                `Invalid max slots for tournament ${id}.`,
+                400,
+                "INVALID_MAX_SLOTS"
+            );
+        }
+
+        const roomId = cleanString(raw?.roomId ?? raw?.roomid, 100);
+        const roomPass = cleanString(raw?.roomPass ?? raw?.password, 100);
+
+        const joinedUsers = existing?.joinedUsers
+            ? [...existing.joinedUsers]
+            : [];
+
+        if (joinedUsers.length > maxSlots) {
+            throw new BackendError(
+                `Cannot reduce tournament ${id} below its current joined player count.`,
+                409,
+                "SLOTS_BELOW_CURRENT"
+            );
+        }
+
+        const status = existing?.status || "open";
+
+        adminTournaments.push(
+            normalizeTournament({
+                ...(existing || {}),
+                id,
+                title: title || existing?.title || `Tournament #${id}`,
+                time,
+                prize,
+                perKill,
+                entry,
+                maxSlots,
+                type: existing?.type || inferTypeFromTitle(title),
+                map: existing?.map || "BERMUDA",
+                roomId,
+                roomPass,
+                joinedUsers,
+                currentJoined: joinedUsers.length,
+                status
+            }, id)
+        );
+    }
+
+    const platform = currentState.config;
+    const saved = await withDbTransaction(async (transactionId) => {
+        for (const tournament of adminTournaments) {
+            const rowId = String(tournament.id);
+            const existingRow = await (async () => {
+                try {
+                    return await getRow(TABLES.tournaments, rowId);
+                } catch (err) {
+                    if (err?.status === 404) return null;
+                    throw err;
+                }
+            })();
+
+            const tableData = tournamentToTableData(tournament);
+
+            if (existingRow) {
+                await updateRow(
+                    TABLES.tournaments,
+                    rowId,
+                    tableData,
+                    transactionId
+                );
+            } else {
+                await createRow(
+                    TABLES.tournaments,
+                    rowId,
+                    {
+                        ...tableData,
+                        createdAt: nowIso()
+                    },
+                    transactionId
+                );
+            }
+        }
+
+        const configData = {
+            key: PLATFORM_CONFIG_KEY,
+            upiId: platform?.upiId ?? DEFAULT_UPI_ID,
+            qrImgUrl: platform?.qrImgUrl ?? DEFAULT_QR_URL,
+            updatedAt: nowIso(),
+            updatedBy: uid,
+            tournaments: adminTournaments
+        };
+
+        if (platform) {
+            await updateRow(
+                TABLES.config,
+                platform.$id,
+                { tournaments: adminTournaments, updatedAt: nowIso(), updatedBy: uid },
+                transactionId
+            );
+        } else {
+            await createRow(
+                TABLES.config,
+                PLATFORM_CONFIG_KEY,
+                configData,
+                transactionId
+            );
+        }
+
+        return adminTournaments.map(publicTournament);
     });
-  } catch (err) {
-    return ctx.res.json({
-      success: false,
-      error: err.message || 'Server error'
-    }, err.status || 500);
-  }
+
+    return { tournaments: saved };
+}
+
+async function actionCreateProfile(req, data) {
+    const uid = await requireAuth(req);
+
+    const username = cleanString(data?.username, 100) || "Gamer";
+    const phone = normalizePhone(data?.phone);
+
+    if (!/^\d{10,15}$/.test(phone)) {
+        throw new BackendError(
+            "Invalid phone number.",
+            400,
+            "INVALID_PHONE"
+        );
+    }
+
+    const existing = await findUserByUid(uid);
+
+    if (existing) {
+        const updated = await updateRow(TABLES.users, existing.$id, {
+            username,
+            name: username,
+            phone
+        });
+
+        return normalizeProfile(updated);
+    }
+
+    const row = await createRow(TABLES.users, uid.slice(0, 36), {
+        uid,
+        username,
+        name: username,
+        phone,
+        balance: 0,
+        depositBalance: 0,
+        winningBalance: 0,
+        createdAt: nowIso()
+    });
+
+    return normalizeProfile(row);
+}
+
+async function actionGetProfile(req) {
+    const uid = await requireAuth(req);
+    const profile = await findUserByUid(uid);
+
+    if (!profile) {
+        throw new BackendError(
+            "User profile not found. Please register again.",
+            404,
+            "PROFILE_NOT_FOUND"
+        );
+    }
+
+    return normalizeProfile(profile);
+}
+
+async function actionJoinTournament(req, data) {
+    const uid = await requireAuth(req);
+
+    const tournamentId = Number(data?.tournamentId);
+    if (!Number.isInteger(tournamentId) || tournamentId <= 0) {
+        throw new BackendError(
+            "Invalid tournament selection.",
+            400,
+            "INVALID_TOURNAMENT_ID"
+        );
+    }
+
+    const ffUid = validateFreeFireUid(data?.ffUid);
+    const ffName = validateFreeFireName(data?.ffName);
+
+    const state = await getTournamentState();
+    const tournament = state.tournaments.find(
+        (t) => Number(t.id) === tournamentId
+    );
+
+    if (!tournament) {
+        throw new BackendError(
+            "Tournament not found.",
+            404,
+            "TOURNAMENT_NOT_FOUND"
+        );
+    }
+
+    assertTournamentOpen(tournament);
+
+    if (tournament.joinedUsers.includes(String(uid))) {
+        throw new BackendError(
+            "You have already joined this tournament.",
+            409,
+            "ALREADY_JOINED"
+        );
+    }
+
+    const entryFee = assertMoney(
+        tournament.entry,
+        "tournament entry fee",
+        1000000
+    );
+
+    const profile = await findUserByUid(uid);
+    if (!profile) {
+        throw new BackendError(
+            "User profile not found.",
+            404,
+            "PROFILE_NOT_FOUND"
+        );
+    }
+
+    const currentProfile = normalizeProfile(profile);
+    const newWallet = spendWallet(currentProfile, entryFee);
+
+    const newJoinedUsers = [...tournament.joinedUsers, String(uid)];
+    const newTournament = normalizeTournament({
+        ...tournament,
+        joinedUsers: newJoinedUsers,
+        currentJoined: newJoinedUsers.length
+    }, tournamentId);
+
+    if (newTournament.currentJoined > newTournament.maxSlots) {
+        throw new BackendError(
+            "Tournament became full. Please try another match.",
+            409,
+            "TOURNAMENT_FULL"
+        );
+    }
+
+    const joinRowId = hashId(`tournament:${tournamentId}:user:${uid}`, "join");
+
+    const result = await withDbTransaction(async (transactionId) => {
+        let existingJoin = null;
+        try {
+            existingJoin = await getRow(TABLES.transactions, joinRowId);
+        } catch (err) {
+            if (err?.status !== 404) throw err;
+        }
+
+        if (existingJoin) {
+            throw new BackendError(
+                "You have already joined this tournament.",
+                409,
+                "ALREADY_JOINED"
+            );
+        }
+
+        // If an older transaction row was created without joinKey, also inspect
+        // the user/tournament identity encoded in details.
+        const oldJoins = await listRows(TABLES.transactions, [
+            queryString("equal", "user_id", [uid]),
+            queryString("equal", "type", ["Tournament"]),
+            queryString("limit", "", [100])
+        ]);
+
+        const duplicateOldJoin = (oldJoins?.rows || []).find((row) => {
+            const d = String(row.details || "");
+            return (
+                d.includes(`Tournament ID: ${tournamentId}`) &&
+                ["Pending", "Approved", "Completed"].includes(String(row.status))
+            );
+        });
+
+        if (duplicateOldJoin) {
+            throw new BackendError(
+                "You have already joined this tournament.",
+                409,
+                "ALREADY_JOINED"
+            );
+        }
+
+        await updateRow(
+            TABLES.users,
+            profile.$id,
+            {
+                balance: newWallet.balance,
+                depositBalance: newWallet.depositBalance,
+                winningBalance: newWallet.winningBalance
+            },
+            transactionId
+        );
+
+        const platform = state.config;
+        if (platform) {
+            const latestConfig = await getRow(TABLES.config, platform.$id);
+            const latestArray = Array.isArray(latestConfig?.tournaments)
+                ? latestConfig.tournaments.map((t) => normalizeTournament(t))
+                : [];
+
+            const latestTournament =
+                latestArray.find((t) => Number(t.id) === tournamentId) ||
+                newTournament;
+
+            if (latestTournament.joinedUsers.includes(String(uid))) {
+                throw new BackendError(
+                    "You have already joined this tournament.",
+                    409,
+                    "ALREADY_JOINED"
+                );
+            }
+
+            if (latestTournament.joinedUsers.length >= latestTournament.maxSlots) {
+                throw new BackendError(
+                    "Tournament is full.",
+                    409,
+                    "TOURNAMENT_FULL"
+                );
+            }
+
+            latestTournament.joinedUsers = [
+                ...latestTournament.joinedUsers,
+                String(uid)
+            ];
+            latestTournament.currentJoined =
+                latestTournament.joinedUsers.length;
+
+            const mergedArray = latestArray.map((t) =>
+                Number(t.id) === tournamentId ? latestTournament : t
+            );
+
+            if (!latestArray.some((t) => Number(t.id) === tournamentId)) {
+                mergedArray.push(latestTournament);
+            }
+
+            await updateRow(
+                TABLES.config,
+                platform.$id,
+                {
+                    tournaments: mergedArray,
+                    updatedAt: nowIso(),
+                    updatedBy: uid
+                },
+                transactionId
+            );
+        } else {
+            await createRow(
+                TABLES.config,
+                PLATFORM_CONFIG_KEY,
+                {
+                    key: PLATFORM_CONFIG_KEY,
+                    upiId: DEFAULT_UPI_ID,
+                    qrImgUrl: DEFAULT_QR_URL,
+                    updatedAt: nowIso(),
+                    updatedBy: uid,
+                    tournaments: [newTournament]
+                },
+                transactionId
+            );
+        }
+
+        await createRow(
+            TABLES.transactions,
+            joinRowId,
+            {
+                user_id: uid,
+                username: currentProfile.username,
+                type: "Tournament",
+                status: "Completed",
+                amount: entryFee,
+                details:
+                    `Tournament ID: ${tournamentId}; ` +
+                    `Tournament: ${newTournament.title}; ` +
+                    `Free Fire UID: ${ffUid}; ` +
+                    `In-game Name: ${ffName}`
+            },
+            transactionId
+        );
+
+        return newTournament;
+    }, 60);
+
+    return {
+        success: true,
+        tournament: publicTournament(result)
+    };
+}
+
+async function actionAdminListUsers(req) {
+    await requireAdmin(req);
+
+    const rows = await listAllRows(TABLES.users, [], 5000);
+
+    const users = rows
+        .map(normalizeProfile)
+        .filter(Boolean)
+        .sort((a, b) =>
+            String(b.createdAt || "").localeCompare(String(a.createdAt || ""))
+        );
+
+    return { users };
+}
+
+async function findUserByQuery(userQuery) {
+    const q = cleanString(userQuery, 150);
+    if (!q) {
+        throw new BackendError(
+            "User ID or phone is required.",
+            400,
+            "USER_QUERY_REQUIRED"
+        );
+    }
+
+    let user = await findOne(TABLES.users, [
+        queryString("equal", "uid", [q])
+    ]);
+
+    if (user) return user;
+
+    user = await findOne(TABLES.users, [
+        queryString("equal", "$id", [q])
+    ]);
+
+    if (user) return user;
+
+    const phone = normalizePhone(q);
+    if (/^\d{10,15}$/.test(phone)) {
+        user = await findOne(TABLES.users, [
+            queryString("equal", "phone", [phone])
+        ]);
+        if (user) return user;
+    }
+
+    user = await findOne(TABLES.users, [
+        queryString("equal", "username", [q])
+    ]);
+
+    return user;
+}
+
+async function actionAdminAddMoney(req, data) {
+    const { uid: adminUid } = await requireAdmin(req);
+
+    const amount = assertMoney(data?.amount, "amount", 10000000);
+    const target = await findUserByQuery(data?.userQuery);
+
+    if (!target) {
+        throw new BackendError(
+            "User not found. Check the registered phone number or UID.",
+            404,
+            "USER_NOT_FOUND"
+        );
+    }
+
+    const profile = normalizeProfile(target);
+
+    const result = await withDbTransaction(async (transactionId) => {
+        const current = await getRow(TABLES.users, target.$id);
+        const currentProfile = normalizeProfile(current);
+
+        const newBalance = money(currentProfile.balance + amount);
+        const newDeposit = money(currentProfile.depositBalance + amount);
+
+        await updateRow(
+            TABLES.users,
+            target.$id,
+            {
+                balance: newBalance,
+                depositBalance: newDeposit
+            },
+            transactionId
+        );
+
+        await createRow(
+            TABLES.transactions,
+            makeId("admin"),
+            {
+                user_id: currentProfile.uid,
+                username: currentProfile.username,
+                type: "AdminCredit",
+                status: "Approved",
+                amount,
+                details: `Admin direct credit by ${adminUid}`,
+            },
+            transactionId
+        );
+
+        return {
+            uid: currentProfile.uid,
+            balance: newBalance
+        };
+    }, 60);
+
+    return result;
+}
+
+async function actionSubmitDeposit(req, data) {
+    const uid = await requireAuth(req);
+    const amount = assertMoney(data?.amount, "deposit amount", 10000000);
+
+    const utr = normalizeUtr(data?.utr);
+
+    if (!/^\d{12}$/.test(utr)) {
+        throw new BackendError(
+            "UTR must be exactly 12 digits.",
+            400,
+            "INVALID_UTR"
+        );
+    }
+
+    const profile = await findUserByUid(uid);
+    if (!profile) {
+        throw new BackendError(
+            "User profile not found.",
+            404,
+            "PROFILE_NOT_FOUND"
+        );
+    }
+
+    const duplicate = await findOne(TABLES.transactions, [
+        queryString("equal", "utr", [utr])
+    ]);
+
+    if (duplicate) {
+        throw new BackendError(
+            "This UTR has already been submitted.",
+            409,
+            "DUPLICATE_UTR"
+        );
+    }
+
+    const txId = hashId(`deposit:${utr}`, "dep");
+
+    try {
+        await createRow(TABLES.transactions, txId, {
+            user_id: uid,
+            username: normalizeProfile(profile).username,
+            type: "Deposit",
+            status: "Pending",
+            utr,
+            amount,
+            details: `UTR: ${utr}`,
+        });
+    } catch (err) {
+        if (err?.status === 409) {
+            throw new BackendError(
+                "This UTR has already been submitted.",
+                409,
+                "DUPLICATE_UTR"
+            );
+        }
+        throw err;
+    }
+
+    return {
+        success: true,
+        transactionId: txId,
+        status: "Pending"
+    };
+}
+
+async function actionRequestWithdrawal(req, data) {
+    const uid = await requireAuth(req);
+    const amount = assertMoney(data?.amount, "withdrawal amount", 10000000);
+
+    const method = cleanString(data?.method, 20).toLowerCase();
+    const details = canonicalWithdrawalDetails(method, data?.details);
+
+    const profileRow = await findUserByUid(uid);
+    if (!profileRow) {
+        throw new BackendError(
+            "User profile not found.",
+            404,
+            "PROFILE_NOT_FOUND"
+        );
+    }
+
+    const result = await withDbTransaction(async (transactionId) => {
+        const currentRow = await getRow(TABLES.users, profileRow.$id);
+        const profile = normalizeProfile(currentRow);
+
+        // Withdrawals are specifically for winnings in this UI.
+        if ((profile.winningBalance || 0) + 0.0001 < amount) {
+            throw new BackendError(
+                "Withdrawal amount cannot exceed your winning balance.",
+                409,
+                "INSUFFICIENT_WINNINGS"
+            );
+        }
+
+        const newBalance = money(profile.balance - amount);
+        const newWinning = money(profile.winningBalance - amount);
+
+        if (newBalance < -0.0001 || newWinning < -0.0001) {
+            throw new BackendError(
+                "Insufficient winning balance.",
+                409,
+                "INSUFFICIENT_WINNINGS"
+            );
+        }
+
+        await updateRow(
+            TABLES.users,
+            profileRow.$id,
+            {
+                balance: Math.max(0, newBalance),
+                winningBalance: Math.max(0, newWinning)
+            },
+            transactionId
+        );
+
+        const txId = makeId("wd");
+
+        await createRow(
+            TABLES.transactions,
+            txId,
+            {
+                user_id: uid,
+                username: profile.username,
+                type: "Withdraw",
+                status: "Pending",
+                amount,
+                details,
+            },
+            transactionId
+        );
+
+        return {
+            transactionId: txId,
+            balance: Math.max(0, newBalance),
+            winningBalance: Math.max(0, newWinning)
+        };
+    }, 60);
+
+    return {
+        success: true,
+        status: "Pending",
+        ...result
+    };
+}
+
+function transactionForAdmin(row) {
+    return {
+        id: row.$id,
+        userId: row.user_id ?? "",
+        username: row.username ?? "Gamer",
+        type: row.type ?? "",
+        status: row.status ?? "",
+        utr: row.utr ?? "",
+        amount: money(row.amount) || 0,
+        details: row.details ?? "",
+        timestamp: row.$createdAt ?? ""
+    };
+}
+
+async function actionAdminListTransactions(req) {
+    await requireAdmin(req);
+
+    const rows = await listAllRows(
+        TABLES.transactions,
+        [
+            queryString("equal", "status", ["Pending"])
+        ],
+        5000
+    );
+
+    const transactions = rows
+        .map(transactionForAdmin)
+        .sort((a, b) =>
+            String(b.timestamp).localeCompare(String(a.timestamp))
+        );
+
+    return { transactions };
+}
+
+async function actionApproveTransaction(req, data) {
+    const { uid: adminUid } = await requireAdmin(req);
+
+    const txId = cleanString(data?.txId, 100);
+    const decision = cleanString(data?.decision, 30).toLowerCase();
+
+    if (!txId) {
+        throw new BackendError(
+            "Transaction ID is required.",
+            400,
+            "TX_ID_REQUIRED"
+        );
+    }
+
+    if (!["approve", "reject", "approved", "rejected"].includes(decision)) {
+        throw new BackendError(
+            "Invalid transaction decision.",
+            400,
+            "INVALID_DECISION"
+        );
+    }
+
+    const approved = decision === "approve" || decision === "approved";
+
+    const result = await withDbTransaction(async (transactionId) => {
+        const tx = await getRow(TABLES.transactions, txId);
+
+        if (String(tx.status) !== "Pending") {
+            throw new BackendError(
+                `Transaction is already ${tx.status}.`,
+                409,
+                "TRANSACTION_ALREADY_PROCESSED"
+            );
+        }
+
+        const type = String(tx.type || "");
+        const userId = String(tx.user_id ?? "");
+        const amount = assertMoney(tx.amount, "transaction amount");
+
+        if (!userId) {
+            throw new BackendError(
+                "Transaction has no user ID.",
+                409,
+                "TRANSACTION_USER_MISSING"
+            );
+        }
+
+        const user = await findUserByUid(userId);
+        if (!user) {
+            throw new BackendError(
+                "Transaction user no longer exists.",
+                404,
+                "TRANSACTION_USER_NOT_FOUND"
+            );
+        }
+
+        if (type === "Deposit") {
+            if (approved) {
+                const profile = normalizeProfile(user);
+                const newBalance = money(profile.balance + amount);
+                const newDeposit = money(profile.depositBalance + amount);
+
+                await updateRow(
+                    TABLES.users,
+                    user.$id,
+                    {
+                        balance: newBalance,
+                        depositBalance: newDeposit
+                    },
+                    transactionId
+                );
+
+                await updateRow(
+                    TABLES.transactions,
+                    tx.$id,
+                    {
+                        status: "Approved"
+                    },
+                    transactionId
+                );
+
+                return {
+                    status: "Approved",
+                    balance: newBalance,
+                    userId,
+                    adminUid
+                };
+            }
+
+            await updateRow(
+                TABLES.transactions,
+                tx.$id,
+                {
+                    status: "Rejected"
+                },
+                transactionId
+            );
+
+            return {
+                status: "Rejected",
+                userId,
+                adminUid
+            };
+        }
+
+        if (type === "Withdraw") {
+            if (approved) {
+                await updateRow(
+                    TABLES.transactions,
+                    tx.$id,
+                    {
+                        status: "Approved"
+                    },
+                    transactionId
+                );
+
+                return {
+                    status: "Approved",
+                    userId,
+                    adminUid
+                };
+            }
+
+            const profile = normalizeProfile(user);
+            const refunded = refundWinningWallet(profile, amount);
+
+            await updateRow(
+                TABLES.users,
+                user.$id,
+                {
+                    balance: refunded.balance,
+                    winningBalance: refunded.winningBalance
+                },
+                transactionId
+            );
+
+            await updateRow(
+                TABLES.transactions,
+                tx.$id,
+                {
+                    status: "Rejected"
+                },
+                transactionId
+            );
+
+            return {
+                status: "Rejected",
+                refunded: amount,
+                balance: refunded.balance,
+                winningBalance: refunded.winningBalance,
+                userId,
+                adminUid
+            };
+        }
+
+        throw new BackendError(
+            `Transaction type "${type}" cannot be approved from this panel.`,
+            400,
+            "UNSUPPORTED_TRANSACTION_TYPE"
+        );
+    }, 60);
+
+    return result;
+}
+
+const ACTIONS = {
+    verifyAdmin: actionVerifyAdmin,
+    getPlatformConfig: actionGetPlatformConfig,
+    setPlatformConfig: actionSetPlatformConfig,
+    getTournaments: actionGetTournaments,
+    setTournaments: actionSetTournaments,
+    createProfile: actionCreateProfile,
+    getProfile: actionGetProfile,
+    joinTournament: actionJoinTournament,
+    adminListUsers: actionAdminListUsers,
+    adminAddMoney: actionAdminAddMoney,
+    submitDeposit: actionSubmitDeposit,
+    requestWithdrawal: actionRequestWithdrawal,
+    adminListTransactions: actionAdminListTransactions,
+    approveTransaction: actionApproveTransaction
+};
+
+export default async ({ req, res, log, error }) => {
+    const startedAt = Date.now();
+
+    try {
+        if (req?.method === "OPTIONS") {
+            return res.send(
+                "",
+                204,
+                {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers":
+                        "Content-Type, X-Appwrite-Project, X-Appwrite-User-JWT"
+                }
+            );
+        }
+
+        const body = parseBody(req);
+        const action = cleanString(body?.action, 100);
+        const data =
+            body?.data && typeof body.data === "object"
+                ? body.data
+                : {};
+
+        if (!action) {
+            throw new BackendError(
+                "Missing action.",
+                400,
+                "ACTION_REQUIRED"
+            );
+        }
+
+        const handler = ACTIONS[action];
+        if (!handler) {
+            throw new BackendError(
+                `Unsupported action: ${action}`,
+                400,
+                "UNKNOWN_ACTION"
+            );
+        }
+
+        log?.(`Action ${action} started`);
+
+        const result = await handler(req, data);
+
+        log?.(`Action ${action} completed in ${Date.now() - startedAt}ms`);
+
+        return res.json(
+            {
+                ok: true,
+                data: result
+            },
+            200
+        );
+    } catch (err) {
+        const status =
+            err instanceof BackendError
+                ? err.status
+                : Number(err?.status) >= 400 && Number(err?.status) < 600
+                    ? Number(err.status)
+                    : 500;
+
+        const message =
+            err?.message ||
+            err?.response?.message ||
+            "Unexpected backend error.";
+
+        error?.(
+            `[${status}] ${message}${err?.stack ? `\n${err.stack}` : ""}`
+        );
+
+        return res.json(
+            {
+                ok: false,
+                error: String(message),
+                code:
+                    err instanceof BackendError
+                        ? err.code
+                        : err?.type || "INTERNAL_SERVER_ERROR"
+            },
+            status
+        );
+    }
 };
